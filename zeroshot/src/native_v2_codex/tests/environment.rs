@@ -8,6 +8,7 @@ fn local_configuration(
     native_environment: BTreeMap<String, String>,
 ) -> NativeV2CodexConfig {
     NativeV2CodexConfig {
+        base_environment: Default::default(),
         provider,
         executable: PathBuf::from("codex"),
         workspace: PathBuf::from("/workspace"),
@@ -18,7 +19,7 @@ fn local_configuration(
         }),
         native_environment: LocalHarnessEnvironment::new(native_environment),
         search_path: "/usr/bin:/bin".to_owned(),
-        process_pool: HostedProcessPool::new(10_002, 10_002, 20_000, 20_000).assert_value(),
+        process_pool: HostedProcessPool::new(10_002, 10_002, 20_000).assert_value(),
     }
 }
 

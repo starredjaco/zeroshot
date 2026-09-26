@@ -478,6 +478,10 @@ export function assertDocument(value: any): asserts value is Document {
   if (value.name !== undefined && typeof value.name !== 'string')
     throw new Error('Profile name must be text.');
   assertRuntime(value);
+  if (Object.hasOwn(value.runtime, 'environment'))
+    throw new Error(
+      'Environments belong to run submission, not profiles. Remove runtime.environment.'
+    );
   let count = 0;
   const names = new Set<string>();
   function inspect(n: any, depth: number): void {

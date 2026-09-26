@@ -5,18 +5,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use openengine_cluster_protocol::GraphSpec;
+use openengine_cluster_protocol::{GraphSpec, RunId};
 #[cfg(unix)]
-use openengine_cluster_protocol::{NodeInstructions, NodeName, RunId, WorkerRef};
+use openengine_cluster_protocol::{NodeInstructions, NodeName, WorkerRef};
 use serde_json::{Value, json};
 
 #[cfg(unix)]
 use crate::native_v2_admission::NativeV2Admission;
-use crate::native_v2_contract::GIT_DELIVERY_MERGE_V2_WORKER_REF;
+use crate::native_v2_contract::{AdmittedRun, GIT_DELIVERY_MERGE_V2_WORKER_REF};
 #[cfg(unix)]
 use crate::native_v2_contract::{
-    self, AdmittedRun, ExecutionId, ExecutionRef, NodeInstanceId, NodeInvocation,
-    NodeRuntimeBinding, RunSubmission,
+    self, ExecutionId, ExecutionRef, NodeInstanceId, NodeInvocation, NodeRuntimeBinding,
+    RunSubmission,
 };
 use crate::native_v2_delivery::{DeliveryMode};
 use crate::native_v2_delivery::contract::delivery_result_schema;
@@ -318,4 +318,31 @@ pub(crate) fn commit_all(workspace: &Path, message: &str) {
             message,
         ],
     );
+}
+
+pub(crate) fn allocation_request<'a>(
+    run_id: &'a RunId,
+    admitted: &'a AdmittedRun,
+    github_token: Option<&'a str>,
+) -> crate::native_v2_cloud::CapsuleAllocationRequest<'a> {
+    crate::native_v2_cloud::CapsuleAllocationRequest {
+        run_id,
+        admitted,
+        github_token,
+        preparation: crate::native_v2_cloud::CapsulePreparation::quiet(&admitted.runtime)
+            .assert_value(),
+    }
+}
+
+pub(crate) fn codex_runtime(
+    nodes: std::collections::BTreeMap<
+        openengine_cluster_protocol::NodeName,
+        crate::native_v2_contract::NodeRuntimeBinding,
+    >,
+) -> crate::native_v2_contract::RuntimePlan {
+    crate::native_v2_contract::RuntimePlan::Codex {
+        provider: openengine_cluster_protocol::CodexProvider::OpenAi,
+        size: openengine_cluster_protocol::RunSize::Small,
+        nodes,
+    }
 }

@@ -358,6 +358,7 @@ fn exact_test_environment(request: &RunSubmitParams) -> Result<RunEnvironment, N
     ]);
     Ok(RunEnvironment::from_available(
         &request.submission.runtime,
+        request.submission.environment.as_ref(),
         &available,
     )?)
 }
@@ -407,3 +408,17 @@ mod runtime_failure;
 
 #[path = "tests/initialization.rs"]
 mod initialization;
+
+fn test_preparation() -> CapsulePreparation {
+    struct Quiet;
+    #[async_trait]
+    impl PreparationProgress for Quiet {
+        async fn log(&self, _line: &str) -> Result<(), CapsuleAllocationUnavailable> {
+            Ok(())
+        }
+    }
+    CapsulePreparation {
+        environment: exact_test_environment(&request(Value::Null)).assert_value(),
+        progress: Arc::new(Quiet),
+    }
+}

@@ -17,6 +17,9 @@ export type WorkspaceInit = {
   authority: WorkspaceAuthority;
   apiBase: string;
   theme: 'light' | 'dark';
+  view?: 'profiles' | 'environments';
+  environmentApi?: string;
+  readOnly?: boolean;
   csrf?: { cookieName: string; headerName: string };
 };
 export type HostCommand = Envelope &
@@ -134,6 +137,9 @@ function readInit(
   )
     return;
   if (!validCsrf(value.csrf)) return;
+  if (value.view !== undefined && !['profiles', 'environments'].includes(String(value.view)))
+    return;
+  if (value.readOnly !== undefined && typeof value.readOnly !== 'boolean') return;
   if (typeof value.apiBase !== 'string' || !value.apiBase.startsWith('/')) return;
   let base: URL;
   try {
@@ -150,6 +156,7 @@ function readInit(
     !base.pathname.endsWith('/')
   )
     return;
+  if (!validEnvironmentApi(value, base)) return;
   return value as unknown as WorkspaceInit;
 }
 function invalidCommandEnvelope(value: Record<string, unknown>, workspaceId: string): boolean {
@@ -229,6 +236,24 @@ function bounded(value: unknown): value is Record<string, unknown> {
   if (!record(value)) return false;
   try {
     return JSON.stringify(value).length <= 2 * 1024 * 1024;
+  } catch {
+    return false;
+  }
+}
+
+function validEnvironmentApi(value: Record<string, unknown>, base: URL): boolean {
+  if (value.view !== 'environments') return value.environmentApi === undefined;
+  if (typeof value.environmentApi !== 'string' || value.environmentApi.length > 2048) return false;
+  try {
+    const url = new URL(value.environmentApi, base.origin);
+    return (
+      url.origin === base.origin &&
+      url.pathname.startsWith(base.pathname) &&
+      !url.username &&
+      !url.password &&
+      !url.hash &&
+      !url.pathname.endsWith('/')
+    );
   } catch {
     return false;
   }

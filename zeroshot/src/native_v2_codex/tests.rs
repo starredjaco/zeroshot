@@ -205,6 +205,7 @@ fn adapter_with_configuration(
     let workspace = directory.child("workspace");
     fs::create_dir_all(&workspace).assert_value();
     Arc::new(NativeV2CodexAdapter::new_for_test(NativeV2CodexConfig {
+        base_environment: Default::default(),
         provider,
         executable,
         workspace,
@@ -212,7 +213,7 @@ fn adapter_with_configuration(
         local_user: None,
         native_environment: Default::default(),
         search_path: "/usr/bin:/bin".to_owned(),
-        process_pool: HostedProcessPool::new(10_002, 10_002, 20_000, 20_000).assert_value(),
+        process_pool: HostedProcessPool::new(10_002, 10_002, 20_000).assert_value(),
     }))
 }
 
@@ -256,6 +257,7 @@ async fn admitted(binding: NodeRuntimeBinding, provider: CodexProvider) -> Admit
         success_node(),
     ]);
     admit(RunSubmission {
+        environment: None,
         title: RunTitle::new("Codex adapter test").assert_value(),
         graph,
         initial_input: Value::Null,

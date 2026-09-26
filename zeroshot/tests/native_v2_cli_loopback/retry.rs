@@ -2,7 +2,7 @@ use openengine_cluster_testkit::assertions::AssertValue;
 use super::*;
 use zeroshot_engine::native_v2_claude::{ClaudeAdapter, ClaudeAdapterConfig, ClaudeProcessEnvironment};
 use zeroshot_engine::native_v2_codex::{NativeV2CodexAdapter, NativeV2CodexConfig};
-use zeroshot_engine::native_v2_contract::{ClaudeProvider, CodexProvider};
+use zeroshot_engine::native_v2_contract::{AdmittedRun, ClaudeProvider, CodexProvider};
 
 type ClaimResult = Result<Arc<dyn ExclusiveControllerClaim>, ControllerClaimUnavailable>;
 type AllocationResult = Result<AllocatedCapsule, CapsuleAllocationUnavailable>;
@@ -76,10 +76,14 @@ impl CapsuleAllocator for RetryAllocator {
 
     async fn allocate(
         &self,
-        _run_id: &RunId,
-        admitted: &AdmittedRun,
-        _github_token: Option<&str>,
+        request: zeroshot_engine::native_v2_cloud::CapsuleAllocationRequest<'_>,
     ) -> AllocationResult {
+        let zeroshot_engine::native_v2_cloud::CapsuleAllocationRequest {
+            run_id: _run_id,
+            admitted,
+            github_token: _github_token,
+            ..
+        } = request;
         let runner = match self.lane {
             RetryLane::Codex => self.codex_runner(admitted)?,
             RetryLane::Claude => self.claude_runner(admitted)?,
@@ -109,6 +113,7 @@ impl RetryAllocator {
     ) -> Result<Arc<dyn zeroshot_engine::native_v2_runner::NodeRunner>, CapsuleAllocationUnavailable>
     {
         let adapter = Arc::new(NativeV2CodexAdapter::new_local(NativeV2CodexConfig {
+            base_environment: Default::default(),
             provider: CodexProvider::OpenAi,
             executable: self.executable.clone(),
             workspace: self.workspace.clone(),
@@ -116,7 +121,7 @@ impl RetryAllocator {
             local_user: None,
             native_environment: Default::default(),
             search_path: "/usr/bin:/bin".to_owned(),
-            process_pool: HostedProcessPool::new(10_002, 10_002, 20_000, 20_000)
+            process_pool: HostedProcessPool::new(10_002, 10_002, 20_000)
                 .map_err(|_| CapsuleAllocationUnavailable::Runtime)?,
         }));
         let runner = NativeNodeRunner::new(admitted, adapter.clone(), adapter)
@@ -147,7 +152,7 @@ impl RetryAllocator {
                 local_user_home: None,
                 native_environment: Default::default(),
                 base_environment,
-                process_pool: HostedProcessPool::new(10_002, 10_002, 20_000, 20_000)
+                process_pool: HostedProcessPool::new(10_002, 10_002, 20_000)
                     .map_err(|_| CapsuleAllocationUnavailable::Runtime)?,
             })
             .map_err(|_| CapsuleAllocationUnavailable::Runtime)?,

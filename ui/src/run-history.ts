@@ -1,3 +1,4 @@
+import type { EnvironmentDefinition } from './environment-store';
 import type { HistoryObservation } from './history-contract';
 import { allNodes, children, isGroup, pathTo, type Document, type GraphNode } from './domain';
 import { projectControlHistory, type ControlRecord } from './control-history';
@@ -29,6 +30,7 @@ export type RunDetail = Omit<RunSummary, 'cursor' | 'terminal'> & {
   terminal?: RunTerminal | null;
   graph: Document['graph'];
   runtime: Document['runtime'];
+  environment?: EnvironmentDefinition;
   initialInput: unknown;
   history: { initialCursor: string; cursor: string; complete: boolean; limitations: string[] };
 };

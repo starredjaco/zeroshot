@@ -41,14 +41,14 @@ fn run_environment_is_exact_and_request_debug_is_redacted() {
         (declared.clone(), "openai-secret".to_owned()),
         (unused, "unused-secret".to_owned()),
     ]);
-    let selected = RunEnvironment::from_available(&runtime, &available)
+    let selected = RunEnvironment::from_available(&runtime, None, &available)
         .assert_value_with("select declared environment");
     let supplied = BTreeMap::from([(
         ConnectionKey::new("provider").assert_value_with("connection key"),
         StaticConnectionValues::new(available.clone()).assert_value_with("connection values"),
     )]);
     assert!(matches!(
-        RunEnvironment::exact(&runtime, supplied.clone()),
+        RunEnvironment::exact(&runtime, None, supplied.clone()),
         Err(RunEnvironmentError::UndeclaredField(_, _))
     ));
     let selected_debug = format!("{selected:?}");
@@ -314,8 +314,8 @@ fn hosted_worker_cannot_read_the_ledger_or_another_candidate() {
         fs::create_dir(run_root).assert_value();
         fs::set_permissions(run_root, fs::Permissions::from_mode(0o711)).assert_value();
     }
-    let first_pool = HostedProcessPool::new(31_002, 31_002, 32_000, 32_000).assert_value();
-    let second_pool = HostedProcessPool::new(31_003, 31_003, 33_000, 33_000).assert_value();
+    let first_pool = HostedProcessPool::new(31_002, 31_002, 32_000).assert_value();
+    let second_pool = HostedProcessPool::new(31_003, 31_003, 33_000).assert_value();
     let first = prepare_capsule_filesystem(CapsuleFilesystemSpec {
         workspace: &first_root.join("workspace"),
         runtime_home: &first_root.join("runtime"),
@@ -505,7 +505,9 @@ async fn allocator_uses_one_workspace_then_cleans_without_replacement() {
     );
 
     let capsule = allocator
-        .allocate(&run_id, &admitted, None)
+        .allocate(
+            crate::native_v2_candidate::test_support::allocation_request(&run_id, &admitted, None),
+        )
         .await
         .assert_value_with("allocate capsule");
     assert_eq!(
@@ -518,7 +520,16 @@ async fn allocator_uses_one_workspace_then_cleans_without_replacement() {
     );
     assert!(run_path.join("workspace/.git").is_dir());
     assert!(run_path.join("runtime").is_dir());
-    assert!(allocator.allocate(&run_id, &admitted, None).await.is_err());
+    assert!(
+        allocator
+            .allocate(
+                crate::native_v2_candidate::test_support::allocation_request(
+                    &run_id, &admitted, None
+                )
+            )
+            .await
+            .is_err()
+    );
 
     capsule
         .cleanup
@@ -530,7 +541,16 @@ async fn allocator_uses_one_workspace_then_cleans_without_replacement() {
         .destroy_or_confirm_absent(&run_id, RunRuntimeExit::RuntimeLost)
         .await
         .assert_value_with("confirm absent");
-    assert!(allocator.allocate(&run_id, &admitted, None).await.is_err());
+    assert!(
+        allocator
+            .allocate(
+                crate::native_v2_candidate::test_support::allocation_request(
+                    &run_id, &admitted, None
+                )
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -589,7 +609,9 @@ async fn default_claude_environment_owns_private_session_home_until_completion()
     let run_id = RunId::new("run-hosting-claude-environment");
     let run_path = allocator.run_path(&run_id);
     let capsule = allocator
-        .allocate(&run_id, &admitted, None)
+        .allocate(
+            crate::native_v2_candidate::test_support::allocation_request(&run_id, &admitted, None),
+        )
         .await
         .assert_value_with("allocate Claude capsule");
     let node = NodeName::new("work").assert_value_with("node");

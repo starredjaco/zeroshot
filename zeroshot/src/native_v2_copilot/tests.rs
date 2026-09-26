@@ -66,6 +66,7 @@ async fn admitted(binding: NodeRuntimeBinding, instructions: &str) -> AdmittedRu
         success_node(),
     ]);
     admit(RunSubmission {
+        environment: None,
         title: RunTitle::new("Copilot contract test").assert_value(),
         graph,
         initial_input: Value::Null,
