@@ -426,6 +426,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   expiring credentials use the runtime resolver callback, validate the configured GitHub host, and
   must retain more than one hour. Present but empty or malformed declared credentials fail closed
   instead of falling back to native login.
+  Grammar compilation rate limits retry at most three times with exponential backoff and
+  per-session staggering after confirmed cleanup and a successful event drain. Retries resume
+  the same session with its current correction prompt and host context; other provider errors
+  remain terminal.
   Copilot RPC bounds each message to 64 MiB and bounds pending requests and output queues.
   After an accepted answer, a valid `session.detach` refusal or peer EOF is logged and keeps the
   outcome, including a closed stdin pipe during that request. Malformed RPC replies/events, other
