@@ -343,7 +343,7 @@ enum TemplateCommand {
     /// List built-in template names as JSON.
     List,
 
-    /// Write a built-in graph template as JSON.
+    /// Show a built-in graph as a tree in terminals, or JSON when piped.
     Show(TemplateShowArgs),
 }
 
@@ -451,6 +451,10 @@ struct TemplateShowArgs {
     /// Built-in graph template to render.
     #[arg(value_enum, value_name = "TEMPLATE")]
     template: TemplateName,
+
+    /// Write the complete graph as JSON even when stdout is a terminal.
+    #[arg(long)]
+    json: bool,
 
     #[command(flatten)]
     delivery: DeliveryArgs,
