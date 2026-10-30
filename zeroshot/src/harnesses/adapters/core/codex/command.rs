@@ -1,0 +1,193 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::native_v2_capsule::gateway;
+use crate::native_v2_capsule::provider_process::effort_token;
+use crate::native_v2_contract::{CodexProvider, NodeRuntimeBinding};
+use crate::native_v2_runner::{NodeRunnerError, ResolvedEnvironment};
+use crate::worker_catalog::{ModelId, ReasoningEffort};
+
+pub(super) const LOCAL_ENVIRONMENT: &[&str] = &[
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "CODEX_BASE_URL",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+];
+
+pub(super) const AWS_BEARER_TOKEN_BEDROCK: &str = "AWS_BEARER_TOKEN_BEDROCK";
+pub(super) const AWS_REGION: &str = "AWS_REGION";
+const CODEX_HOME: &str = "CODEX_HOME";
+const CODEX_API_KEY: &str = "CODEX_API_KEY";
+const HOME: &str = "HOME";
+const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
+const PATH: &str = "PATH";
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+pub(super) fn process_environment(
+    environment: &ResolvedEnvironment,
+    home: String,
+    codex_home: String,
+    search_path: String,
+) -> Result<BTreeMap<String, String>, NodeRunnerError> {
+    let mut values = environment
+        .iter()
+        .map(|(name, value)| (name.as_str().to_owned(), value.to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    if search_path.is_empty() || search_path.contains('\0') {
+        return Err(NodeRunnerError::Driver);
+    }
+    if values.contains_key(CODEX_HOME) || values.contains_key(HOME) || values.contains_key(PATH) {
+        return Err(NodeRunnerError::Driver);
+    }
+    values.insert(CODEX_HOME.to_owned(), codex_home);
+    values.insert(HOME.to_owned(), home);
+    values.insert(PATH.to_owned(), search_path);
+    Ok(values)
+}
+
+pub(super) fn configure_provider_auth(
+    values: &mut BTreeMap<String, String>,
+    provider: CodexProvider,
+    has_local_user: bool,
+) -> Result<(), NodeRunnerError> {
+    match provider {
+        CodexProvider::OpenAi => configure_openai_auth(values, has_local_user),
+        CodexProvider::Bedrock => configure_bedrock_auth(values),
+        CodexProvider::Gateway => {
+            if [
+                CODEX_API_KEY,
+                OPENAI_API_KEY,
+                "OPENROUTER_API_KEY",
+                AWS_BEARER_TOKEN_BEDROCK,
+            ]
+            .iter()
+            .any(|name| values.contains_key(*name))
+            {
+                return Err(NodeRunnerError::Driver);
+            }
+            gateway::connection(values).map(|_| ())
+        }
+        CodexProvider::OpenRouter => values
+            .get("OPENROUTER_API_KEY")
+            .is_some_and(|value| !value.is_empty())
+            .then_some(())
+            .ok_or(NodeRunnerError::Driver),
+    }
+}
+
+fn configure_bedrock_auth(values: &BTreeMap<String, String>) -> Result<(), NodeRunnerError> {
+    if [AWS_BEARER_TOKEN_BEDROCK, AWS_REGION]
+        .iter()
+        .any(|name| !values.get(*name).is_some_and(|value| !value.is_empty()))
+        || [CODEX_API_KEY, OPENAI_API_KEY, "OPENROUTER_API_KEY"]
+            .iter()
+            .any(|name| values.contains_key(*name))
+    {
+        return Err(NodeRunnerError::Driver);
+    }
+    Ok(())
+}
+
+fn configure_openai_auth(
+    values: &mut BTreeMap<String, String>,
+    has_local_user: bool,
+) -> Result<(), NodeRunnerError> {
+    // A local custom provider may use OPENAI_API_KEY as its configured env_key.
+    let openai = if has_local_user {
+        values.get(OPENAI_API_KEY).cloned()
+    } else {
+        values.remove(OPENAI_API_KEY)
+    };
+    if values.contains_key(CODEX_API_KEY) || has_local_user && openai.is_none() {
+        return Ok(());
+    }
+    let value = openai.ok_or(NodeRunnerError::Driver)?;
+    values.insert(CODEX_API_KEY.to_owned(), value);
+    Ok(())
+}
+
+pub(super) fn add_provider_args(
+    argv: &mut Vec<String>,
+    provider: CodexProvider,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), NodeRunnerError> {
+    argv.extend([
+        "--config".to_owned(),
+        match provider {
+            CodexProvider::OpenAi => "model_provider=\"openai\"".to_owned(),
+            CodexProvider::OpenRouter => "model_provider=\"openrouter\"".to_owned(),
+            CodexProvider::Bedrock => "model_provider=\"amazon-bedrock\"".to_owned(),
+            CodexProvider::Gateway => "model_provider=\"gateway\"".to_owned(),
+        },
+    ]);
+    if provider == CodexProvider::OpenRouter {
+        argv.extend([
+            "--config".to_owned(),
+            "model_providers.openrouter.name=\"OpenRouter\"".to_owned(),
+            "--config".to_owned(),
+            format!("model_providers.openrouter.base_url=\"{OPENROUTER_BASE_URL}\""),
+            "--config".to_owned(),
+            "model_providers.openrouter.env_key=\"OPENROUTER_API_KEY\"".to_owned(),
+            "--config".to_owned(),
+            "model_providers.openrouter.wire_api=\"responses\"".to_owned(),
+        ]);
+    }
+    if provider == CodexProvider::Gateway {
+        let (base_url, _) = gateway::connection(environment)?;
+        let base_url = serde_json::to_string(base_url).map_err(|_| NodeRunnerError::Driver)?;
+        argv.extend([
+            "--config".to_owned(),
+            "model_providers.gateway.name=\"Gateway\"".to_owned(),
+            "--config".to_owned(),
+            format!("model_providers.gateway.base_url={base_url}"),
+            "--config".to_owned(),
+            "model_providers.gateway.env_key=\"GATEWAY_API_KEY\"".to_owned(),
+            "--config".to_owned(),
+            "model_providers.gateway.wire_api=\"responses\"".to_owned(),
+            "--config".to_owned(),
+            "model_providers.gateway.requires_openai_auth=false".to_owned(),
+        ]);
+    }
+    Ok(())
+}
+
+pub(super) fn add_resume_command(argv: &mut Vec<String>, resume: Option<&str>) {
+    if resume.is_some() {
+        argv.push("resume".to_owned());
+    }
+}
+
+pub(super) fn add_node_args(argv: &mut Vec<String>, model: &str, effort: Option<ReasoningEffort>) {
+    argv.extend(["--json".to_owned(), "--model".to_owned(), model.to_owned()]);
+    if let Some(effort) = effort {
+        argv.extend([
+            "--config".to_owned(),
+            format!("model_reasoning_effort=\"{}\"", effort_token(effort)),
+        ]);
+    }
+    argv.push("--skip-git-repo-check".to_owned());
+}
+
+pub(super) fn add_session_target(argv: &mut Vec<String>, resume: Option<&str>) {
+    if let Some(session_id) = resume {
+        argv.push(session_id.to_owned());
+    }
+    argv.push("-".to_owned());
+}
+
+pub(super) fn path_text(path: &Path) -> Result<String, NodeRunnerError> {
+    path.to_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or(NodeRunnerError::Driver)
+}
+
+pub(super) fn agent_selection(
+    binding: &NodeRuntimeBinding,
+) -> Result<(&ModelId, Option<&ReasoningEffort>), NodeRunnerError> {
+    let NodeRuntimeBinding::Agent { model, effort, .. } = binding else {
+        return Err(NodeRunnerError::Driver);
+    };
+    Ok((model, effort.as_ref()))
+}

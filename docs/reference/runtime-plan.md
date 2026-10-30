@@ -20,7 +20,7 @@ machine-readable contract.
 
 | Field      | Value                                                                              |
 | ---------- | ---------------------------------------------------------------------------------- |
-| `harness`  | Harness of the default lane: `codex`, `claude`, `copilot`, or `pi`                 |
+| `harness`  | Registered harness of the default lane                                             |
 | `provider` | Provider of the default lane, supported by the selected harness                    |
 | `size`     | `small`, `medium`, or `large`                                                      |
 | `nodes`    | Object mapping each executable graph node name to a [node binding](#node-bindings) |
@@ -56,34 +56,27 @@ This plan binds the three agent nodes of the built-in `software-change` template
 
 ## Harness and provider
 
-`harness` selects which `provider` values parse:
+Harness and provider identifiers are bounded non-control strings. The host registry validates their
+compatibility during admission; see [Harness adapters](../project/harness-adapters.md) for available
+pairs and where each adapter runs. The same compatibility rules apply to an agent node's
+[`lane`](#per-node-lanes).
 
-| `harness` | `provider`                                                |
-| --------- | --------------------------------------------------------- |
-| `codex`   | `openai`, `openrouter`, `bedrock`, `gateway`              |
-| `claude`  | `anthropic`, `openrouter`, `bedrock`, `gateway`           |
-| `copilot` | `github`                                                  |
-| `pi`      | `anthropic`, `openai`, `openrouter`, `bedrock`, `gateway` |
-
-The same pairs apply to an agent node's [`lane`](#per-node-lanes). Any other pair is rejected when
-the plan is read.
-
-`pi/anthropic` and `pi/openai` reuse a local Pi login from `~/.pi/agent`; the other `pi` lanes
+`pi/anthropic`, `pi/openai` and `pi/github` reuse a local Pi login from `~/.pi/agent`; the other `pi` lanes
 need a connection.
 
-`pi/gateway` carries `GATEWAY_BASE_URL`, `GATEWAY_API_KEY`, and `GATEWAY_API`. The last names the
+Pi, Copilot, OpenCode and Hermes gateway lanes carry `GATEWAY_BASE_URL`, `GATEWAY_API_KEY`, and `GATEWAY_API`. The last names the
 wire protocol as `openai-responses`, `openai-completions`, or `anthropic-messages`, so one lane
-reaches any endpoint Pi implements and the model identifier stays opaque and caller-owned. Zeroshot
-never infers the protocol from the identifier, and an unrecognized value fails before launch. The
-synthesized model entry carries a node's `contextWindow` and `maxTokens` only when the caller
-declared them; omitted limits keep Pi's own defaults. The built-in-provider endpoint overrides keep
-Pi's catalog and receive no synthesized model entry.
+selects the native transport and the model identifier stays opaque and caller-owned. Zeroshot
+never infers the protocol from the identifier, and an unrecognized value fails before launch.
+Pi's gateway model entry carries a node's `contextWindow` and `maxTokens` only when the caller
+has declared them; omitted limits keep Pi's own defaults. Built-in-provider endpoint overrides
+keep Pi's catalog and receive no synthesized model entry.
 
-To send the `anthropic` lane to a caller-owned Messages-compatible endpoint, declare
+To send Pi's `anthropic` lane to a caller-owned Messages-compatible endpoint, declare
 `ANTHROPIC_BASE_URL` with any one of the lane's credentials (`ANTHROPIC_API_KEY`,
 `ANTHROPIC_AUTH_TOKEN`, or `ANTHROPIC_OAUTH_TOKEN`); a local run also honors the invoking shell's
 `ANTHROPIC_BASE_URL`. The endpoint override interpolates the API key only when the connection
-supplies it, so a token keeps Pi's own environment authentication. The `openai` lane likewise
+supplies it, so a token keeps Pi's own environment authentication. Pi's `openai` lane likewise
 honors `OPENAI_BASE_URL` or `OPENAI_API_BASE`. Pi ignores these variables itself, so Zeroshot turns each into a provider
 override that keeps that provider's own protocol; the `openai` lane therefore needs a
 Responses-compatible endpoint, and any other protocol uses `pi/gateway`. A declared endpoint ends
@@ -275,8 +268,8 @@ on the default `codex`/`openai` lane, and both reviewers run on Claude Code:
 Each `model` goes to the provider of its node's effective lane, so here `worker` needs an OpenAI
 model identifier and the reviewers need Anthropic ones.
 
-- `lane` accepts the same pairs as the run level, listed in
-  [Harness and provider](#harness-and-provider). An invalid pair is rejected when the plan is read.
+- `lane` follows the same [harness/provider admission rules](#harness-and-provider) as the run
+  level. An invalid pair is rejected when the plan is admitted.
 - A `git_delivery` or `comment_delivery` binding cannot carry a `lane`.
 - A `lane` equal to the run-level pair is accepted, and the node runs exactly as it would without
   one. It is still a `lane` field, so the [target support](#target-support) check applies to it and
@@ -297,8 +290,9 @@ reading the target's discovery document and before it requests an access token o
 target operation failed: target does not support per-node runtime lanes (openengine.node-runtime-lanes/v1)
 ```
 
-Plans without a `lane` are unchanged on the wire and work with every target. Older Zeroshot
-binaries reject a plan that contains a `lane` field when they read it.
+Plans without a `lane` do not require the per-node capability. Targets separately advertise enabled
+harness/provider pairs through `openengine.runtime-harnesses/v1`; see [Targets](../concepts/targets.md).
+Older Zeroshot binaries reject a plan that contains a `lane` field when they read it.
 
 Local profiles are saved together in one file in the configuration store (`ZEROSHOT_CONFIG_DIR`).
 Once any local profile carries a `lane`, an older binary cannot read that file at all. Every local
@@ -315,7 +309,7 @@ the profile or its `lane` fields with the newer binary.
 ### Local runs
 
 Before the controller starts, a local `zeroshot run` or `zeroshot resume` checks that each lane's
-executable, `codex`, `claude`, `copilot`, or `pi`, is on `PATH`. A missing executable fails the
+registered executable is on `PATH`. A missing executable fails the
 command with a message such as:
 
 ```text
@@ -325,10 +319,10 @@ lane claude/anthropic needs the `claude` executable on PATH
 `zeroshot acp` runs the same check when each session opens, against that session's workspace, and
 the session request fails with the same message. When every `PATH` entry is absolute, it also
 checks at startup. An empty or relative entry resolves against the directory the harness starts in,
-which is known only per session, so then the startup check is skipped. The check does not inspect login state; a missing login surfaces at
-that lane's first turn. As in a single-lane run, local `codex`/`openai`, `claude`/`anthropic`,
-`copilot`/`github`, `pi`/`anthropic`, and `pi`/`openai` lanes reuse their harness's native login,
-and other lanes need their provider's connection fields; see [Connections](#connections).
+which is known only per session, so then the startup check is skipped. The check does not inspect
+login state; a missing login surfaces at that lane's first turn. Lanes with native-login support reuse
+their harness's login. Other lanes need provider connection fields; see
+[Runtimes and connections](../concepts/runtimes-and-connections.md#runtime-configuration-contains-names-not-secret-values).
 
 ## Coverage
 
@@ -439,3 +433,9 @@ mode. It may omit the delivery node; if it includes it, the binding must be `git
 with `zeroshot template show TEMPLATE` plus the same delivery flag.
 
 Custom graphs author delivery in both the graph and the plan.
+
+## Contributed harnesses
+
+Official local builds include contributed OpenCode and Hermes adapters; their native CLIs are
+installed separately. See [Harness adapters](../project/harness-adapters.md) for available providers,
+target support and the shared execution and Active Memory contracts.

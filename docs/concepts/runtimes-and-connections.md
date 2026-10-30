@@ -15,7 +15,7 @@ rule.
 
 Each agent node uses:
 
-1. a **harness**, `codex`, `claude`, `copilot`, or `pi`;
+1. a **harness** enabled by the host;
 2. a **provider** supported by that harness;
 3. an opaque provider-owned **model** identifier;
 4. zero or more named **connections**, each declaring exact environment field names.
@@ -26,11 +26,10 @@ The harness and provider form the node's effective lane. A plan's run-level `har
 Claude Code review. Zeroshot starts one harness adapter per distinct effective lane, and each node
 runs on its own lane's CLI. Model and connections are always chosen per node.
 
-The [RuntimePlan reference](../reference/runtime-plan.md#harness-and-provider) lists the accepted
+[Harness adapters](../project/harness-adapters.md) lists available adapters and accepted
 harness/provider pairs, which apply to the default lane and to every node's lane. Admission rejects
-known-incompatible pairs, such as `codex` with `anthropic`, `claude` with `openai`, and `pi` with
-`github`. Zeroshot does not check current provider availability, and model names remain
-provider-owned.
+known-incompatible pairs, such as `codex` with `anthropic` and `claude` with `openai`. Zeroshot
+does not check current provider availability, and model names remain provider-owned.
 
 ## Uniform and exact plans
 
@@ -71,10 +70,9 @@ The submission environment or a target-owned connection store supplies the value
 them out of the graph, runtime JSON, run ledger, and observation records.
 
 When `connections` is omitted, Zeroshot materializes provider access for each node from its
-effective lane and the selected execution placement. On a local run, nodes on the `codex`/`openai`,
-`claude`/`anthropic`, `copilot`/`github`, `pi`/`anthropic`, and `pi`/`openai` lanes reuse the
-harness's native login and configuration without inventing a connection. On a contained target, or
-on any non-native provider lane, a node receives these canonical requirements:
+effective lane and the selected execution placement. Local adapters can reuse native authentication as described in
+[Harness adapters](../project/harness-adapters.md). Lanes requiring a connection and contained targets
+receive these canonical requirements:
 
 | Provider     | Connection key | Fields                                   |
 | ------------ | -------------- | ---------------------------------------- |
@@ -85,7 +83,7 @@ on any non-native provider lane, a node receives these canonical requirements:
 | `bedrock`    | `bedrock`      | `AWS_BEARER_TOKEN_BEDROCK`, `AWS_REGION` |
 | `github`     | `github`       | `COPILOT_GITHUB_TOKEN`                   |
 
-A `pi` gateway run additionally requires `GATEWAY_API`, which names the wire protocol
+Pi, Copilot, OpenCode and Hermes gateway runs additionally require `GATEWAY_API`, which names the wire protocol
 (`openai-responses`, `openai-completions`, or `anthropic-messages`). The Codex and Claude gateway
 lanes do not use it.
 
@@ -124,7 +122,7 @@ Git transport credentials, and target connection examples.
 
 ## Gateways
 
-Use `provider: "gateway"` with `codex`, `claude`, or `pi` and the gateway's model identifier:
+To use a gateway, set `provider: "gateway"` and use the gateway's model identifier:
 
 ```json
 { "harness": "codex", "provider": "gateway", "model": "PROVIDER_MODEL_ID" }
@@ -138,8 +136,8 @@ zeroshot connection set gateway --field GATEWAY_BASE_URL --field GATEWAY_API_KEY
 
 Codex requires the OpenAI **Responses API**, including streaming and tool calls; Chat Completions
 alone is insufficient. It sends the key as a bearer token. Claude requires the Anthropic **Messages
-API** and sends the key in `x-api-key`. The `pi` gateway lane lets the caller name the wire protocol
-in `GATEWAY_API` and reaches any endpoint Pi implements without probing it; an unrecognized value
+API** and sends the key in `x-api-key`. The Pi, Copilot, OpenCode and Hermes gateway lanes let the caller name the wire protocol
+in `GATEWAY_API` and use the selected native transport without probing it; an unrecognized value
 fails before launch. The selected gateway/model must support the harness's
 requests, including structured output. Zeroshot does not probe capabilities or translate protocols.
 

@@ -1,0 +1,1327 @@
+#![cfg(unix)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::Duration;
+use openengine_cluster_protocol::{FailureDiagnosticKind, IdempotencyKey, NodeName, RunSize, RunTitle};
+use openengine_cluster_testkit::assertions::{AssertError, AssertValue};
+use serde_json::{Value, json};
+use super::*;
+use crate::native_v2_runner::LiveOutputStream;
+use crate::execution::SessionScope;
+use crate::native_v2_candidate::test_support::{
+    NodeRequestFixture, TestDirectory, admit, environment_name, full_graph, success_node,
+};
+use crate::native_v2_contract::{
+    AdmittedRun, CopilotProvider, DeclaredConnections, NodeRuntimeBinding, RunSubmission,
+    RuntimePlan,
+};
+use crate::native_v2_runner::{
+    NativeNodeRunner, NodeHandle, NodeRunRequest, NodeRunner, DurableNodeEvent,
+};
+
+mod authentication;
+mod framing;
+mod hosted;
+mod lanes;
+
+const INSTRUCTIONS: &str = "Return answer 42 using the required schema.";
+
+fn script() -> String {
+    openengine_cluster_testkit::fixture::python3_script(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/harnesses/adapters/core/copilot/tests/runtime.py"
+        ))
+        .unwrap(),
+    )
+}
+
+fn binding(names: impl Iterator<Item = String>) -> NodeRuntimeBinding {
+    binding_for_model(names, "auto")
+}
+
+fn binding_for_model(names: impl Iterator<Item = String>, model: &str) -> NodeRuntimeBinding {
+    NodeRuntimeBinding::Agent {
+        lane: None,
+        model: crate::worker_catalog::ModelId::new(model).assert_value(),
+        effort: None,
+        context_window: None,
+        max_tokens: None,
+        session_scope: SessionScope::NodeInstance,
+        connections: DeclaredConnections::single(
+            "github",
+            crate::native_v2_contract::DeclaredEnvironment::new(
+                names
+                    .map(|name| environment_name(&name))
+                    .collect::<BTreeSet<_>>(),
+            )
+            .assert_value(),
+        )
+        .assert_value(),
+    }
+}
+
+async fn admitted(binding: NodeRuntimeBinding, instructions: &str) -> AdmittedRun {
+    admitted_for(binding, instructions, CopilotProvider::Github).await
+}
+
+async fn admitted_for(
+    binding: NodeRuntimeBinding,
+    instructions: &str,
+    provider: CopilotProvider,
+) -> AdmittedRun {
+    let graph = full_graph(vec![
+        json!({
+            "kind":"step", "name":"work", "worker":"agent.work@1",
+            "instructions":instructions, "input":{"kind":"null"},
+            "output":{"kind":"record","fields":{"answer":{"type":{"kind":"integer"},"required":true}}},
+            "inputBindings":[], "writeBindings":[], "attempts":1,
+        }),
+        success_node(),
+    ]);
+    admit(RunSubmission {
+        environment: None,
+        title: RunTitle::new("Copilot contract test").assert_value(),
+        graph,
+        initial_input: Value::Null,
+        runtime: RuntimePlan::new(
+            openengine_cluster_protocol::RuntimeLane::new("copilot", provider.name())
+                .assert_value(),
+            RunSize::Medium,
+            BTreeMap::from([(NodeName::new("work").assert_value(), binding)]),
+        ),
+        source: serde_json::from_value(
+            json!({"repository":"the-open-engine/zeroshot", "branch":"main",
+            "revision":"0123456789abcdef0123456789abcdef01234567"}),
+        )
+        .assert_value(),
+        submission_key: IdempotencyKey::new("copilot-test").assert_value(),
+    })
+    .await
+}
+
+struct Fixture {
+    directory: TestDirectory,
+    runtime: NativeNodeRunner,
+    binding: NodeRuntimeBinding,
+    instructions: &'static str,
+    values: BTreeMap<String, String>,
+}
+
+struct FixturePrompt<'a> {
+    instructions: &'static str,
+    model: &'a str,
+}
+
+fn fixture_values(directory: &TestDirectory, mode: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("TEST_MODE".to_owned(), mode.to_owned()),
+        (
+            "CAPTURE_PATH".to_owned(),
+            directory.child("capture").display().to_string(),
+        ),
+    ])
+}
+
+fn local_user(directory: &TestDirectory) -> CopilotLocalUser {
+    CopilotLocalUser {
+        home: directory.child("user-home"),
+        copilot_home: directory.child("copilot-home"),
+    }
+}
+
+impl Fixture {
+    async fn new(mode: &str) -> Self {
+        Self::with_values(mode, BTreeMap::new()).await
+    }
+
+    async fn with_values(mode: &str, extra: BTreeMap<String, String>) -> Self {
+        let directory = TestDirectory::new("copilot");
+        let executable = directory.write_executable("copilot", &script());
+        let mut values = fixture_values(&directory, mode);
+        values.insert(auth::TOKEN.to_owned(), "gho_fake-secret".to_owned());
+        values.extend(extra);
+        Self::with_executable(directory, executable, values, INSTRUCTIONS).await
+    }
+
+    async fn with_executable(
+        directory: TestDirectory,
+        executable: PathBuf,
+        values: BTreeMap<String, String>,
+        instructions: &'static str,
+    ) -> Self {
+        Self::with_configuration(
+            (directory, executable),
+            values,
+            instructions,
+            (None, BTreeMap::new()),
+        )
+        .await
+    }
+
+    async fn native() -> Self {
+        Self::with_local_context(
+            "native",
+            BTreeMap::from([("NATIVE_CONTEXT".to_owned(), "preserved".to_owned())]),
+        )
+        .await
+    }
+
+    async fn ambient_token() -> Self {
+        Self::with_local_context(
+            "success",
+            BTreeMap::from([("GH_TOKEN".to_owned(), "gho_fake-secret".to_owned())]),
+        )
+        .await
+    }
+
+    async fn custom_provider() -> Self {
+        Self::with_local_provider("provider", BTreeMap::new(), custom_provider_environment()).await
+    }
+
+    async fn provider_key_command() -> Self {
+        Self::with_local_provider(
+            "provider_command",
+            BTreeMap::from([(
+                "COPILOT_PROVIDER_API_KEY_COMMAND".to_owned(),
+                "provider-key-helper --fresh".to_owned(),
+            )]),
+            custom_provider_environment(),
+        )
+        .await
+    }
+
+    async fn invalid_command_environment(name: &str, value: String) -> Self {
+        let mut base = custom_provider_environment();
+        base.remove("COPILOT_PROVIDER_API_KEY");
+        base.insert(
+            "COPILOT_PROVIDER_API_KEY_COMMAND".to_owned(),
+            "provider-key-helper --fresh".to_owned(),
+        );
+        base.insert(name.to_owned(), value);
+        Self::with_local_provider("provider_command", BTreeMap::new(), base).await
+    }
+
+    async fn with_local_provider(
+        mode: &str,
+        extra_values: BTreeMap<String, String>,
+        base_environment: BTreeMap<String, String>,
+    ) -> Self {
+        let directory = TestDirectory::new("copilot-provider");
+        let executable = directory.write_executable("copilot", &script());
+        let mut values = fixture_values(&directory, mode);
+        values.extend(extra_values);
+        let local_user = local_user(&directory);
+        Self::with_configuration(
+            (directory, executable),
+            values,
+            INSTRUCTIONS,
+            (Some(local_user), base_environment),
+        )
+        .await
+    }
+
+    async fn declared_token_over_provider() -> Self {
+        let mut base = custom_provider_environment();
+        base.insert("COPILOT_OFFLINE".to_owned(), "true".to_owned());
+        base.insert(
+            "COPILOT_PROVIDERS_CONFIG".to_owned(),
+            "/unreadable/provider-registry.json".to_owned(),
+        );
+        Self::with_local_provider(
+            "declared_token",
+            BTreeMap::from([(auth::TOKEN.to_owned(), "declared-copilot-token".to_owned())]),
+            base,
+        )
+        .await
+    }
+
+    async fn declared_provider_overlay() -> Self {
+        let mut base = custom_provider_environment();
+        base.insert(
+            "COPILOT_PROVIDER_MODEL_ID".to_owned(),
+            "ambient-capability-model".to_owned(),
+        );
+        base.insert(
+            "COPILOT_PROVIDER_API_KEY_COMMAND".to_owned(),
+            "ambient-key-helper".to_owned(),
+        );
+        base.insert(
+            "COPILOT_PROVIDER_BEARER_TOKEN".to_owned(),
+            "ambient-bearer".to_owned(),
+        );
+        Self::with_local_provider(
+            "provider_overlay",
+            BTreeMap::from([
+                (
+                    "COPILOT_PROVIDER_BASE_URL".to_owned(),
+                    "https://declared.example/v1".to_owned(),
+                ),
+                (
+                    "COPILOT_PROVIDER_API_KEY".to_owned(),
+                    "declared-provider-key".to_owned(),
+                ),
+                (
+                    "COPILOT_PROVIDER_WIRE_MODEL".to_owned(),
+                    "declared-wire-model".to_owned(),
+                ),
+            ]),
+            base,
+        )
+        .await
+    }
+
+    async fn declared_native_setting_overlay() -> Self {
+        let mut base = custom_provider_environment();
+        base.insert("COPILOT_OFFLINE".to_owned(), "false".to_owned());
+        Self::with_local_provider(
+            "settings",
+            BTreeMap::from([("COPILOT_OFFLINE".to_owned(), "true".to_owned())]),
+            base,
+        )
+        .await
+    }
+
+    async fn registry(explicit: bool, command: bool) -> Self {
+        let directory = TestDirectory::new("copilot-registry");
+        let executable = directory.write_executable("copilot", &script());
+        let copilot_home = directory.child("copilot-home");
+        std::fs::create_dir_all(&copilot_home).assert_value();
+        let registry = if command {
+            json!({
+                "providers":[{
+                    "name":"gateway", "type":"openai",
+                    "baseUrl":"https://registry.example/v1",
+                    "apiKeyCommand":"registry-key-helper --fresh",
+                    "wireApi":"responses"
+                }],
+                "models":[{
+                    "id":"fixture", "provider":"gateway",
+                    "modelId":"gpt-5.6-sol", "wireModel":"wire-registry-model"
+                }]
+            })
+        } else {
+            json!({
+                "providers":[{
+                    "name":"gateway", "type":"openai",
+                    "baseUrl":"https://registry.example/v1",
+                    "apiKey":"registry-sensitive-value", "wireApi":"responses"
+                }],
+                "models":[{
+                    "id":"fixture", "provider":"gateway",
+                    "modelId":"gpt-5.6-sol", "wireModel":"wire-registry-model"
+                }]
+            })
+        };
+        let registry_path = if explicit {
+            directory.write("explicit-providers.json", &registry.to_string())
+        } else {
+            let path = copilot_home.join("providers.json");
+            std::fs::write(&path, registry.to_string()).assert_value();
+            path
+        };
+        let mut base = custom_provider_environment();
+        if explicit {
+            base.insert(
+                "COPILOT_PROVIDERS_CONFIG".to_owned(),
+                registry_path.display().to_string(),
+            );
+        }
+        let mode = if command {
+            "registry_command"
+        } else {
+            "registry"
+        };
+        let values = fixture_values(&directory, mode);
+        let local_user = local_user(&directory);
+        Self::with_model_configuration(
+            (directory, executable),
+            values,
+            FixturePrompt {
+                instructions: INSTRUCTIONS,
+                model: "gateway/fixture",
+            },
+            (Some(local_user), base),
+        )
+        .await
+    }
+
+    async fn invalid_registry(contents: &[u8]) -> Self {
+        let directory = TestDirectory::new("copilot-invalid-registry");
+        let executable = directory.write_executable("copilot", &script());
+        let registry_path = directory.child("providers.json");
+        std::fs::write(&registry_path, contents).assert_value();
+        let values = fixture_values(&directory, "native");
+        let local_user = local_user(&directory);
+        Self::with_configuration(
+            (directory, executable),
+            values,
+            INSTRUCTIONS,
+            (
+                Some(local_user),
+                BTreeMap::from([(
+                    "COPILOT_PROVIDERS_CONFIG".to_owned(),
+                    registry_path.display().to_string(),
+                )]),
+            ),
+        )
+        .await
+    }
+
+    async fn with_local_context(mode: &str, base_environment: BTreeMap<String, String>) -> Self {
+        Self::with_local_provider(mode, BTreeMap::new(), base_environment).await
+    }
+
+    async fn with_configuration(
+        source: (TestDirectory, PathBuf),
+        values: BTreeMap<String, String>,
+        instructions: &'static str,
+        native: (Option<CopilotLocalUser>, BTreeMap<String, String>),
+    ) -> Self {
+        Self::with_model_configuration(
+            source,
+            values,
+            FixturePrompt {
+                instructions,
+                model: "auto",
+            },
+            native,
+        )
+        .await
+    }
+
+    async fn with_model_configuration(
+        source: (TestDirectory, PathBuf),
+        values: BTreeMap<String, String>,
+        prompt: FixturePrompt<'_>,
+        native: (Option<CopilotLocalUser>, BTreeMap<String, String>),
+    ) -> Self {
+        let (directory, executable) = source;
+        let (local_user, base_environment) = native;
+        let binding = binding_for_model(values.keys().cloned(), prompt.model);
+        let admitted = admitted(binding.clone(), prompt.instructions).await;
+        let workspace = directory.child("workspace");
+        let runtime_home = directory.child("runtime");
+        std::fs::create_dir_all(&workspace).assert_value();
+        std::fs::create_dir_all(&runtime_home).assert_value();
+        let mut local_command_environment = base_environment.clone();
+        local_command_environment.insert(
+            "COMMAND_DEPENDENCY".to_owned(),
+            "private-command-context".to_owned(),
+        );
+        let adapter = Arc::new(CopilotAdapter::new_local(CopilotConfig {
+            executable,
+            workspace,
+            runtime_home,
+            local_user,
+            base_environment,
+            local_command_environment,
+            search_path: "/usr/bin:/bin".to_owned(),
+            process_pool: HostedProcessPool::hosted_default(),
+        }));
+        let runtime = NativeNodeRunner::new(&admitted, adapter.clone(), adapter).assert_value();
+        Self {
+            directory,
+            runtime,
+            binding,
+            instructions: prompt.instructions,
+            values,
+        }
+    }
+
+    fn request(&self, execution: u64) -> NodeRunRequest {
+        NodeRequestFixture {
+            run_id: "run-copilot",
+            node: "work",
+            node_instance: 1,
+            execution,
+            worker: "agent.work@1",
+            instructions: self.instructions,
+            input: Value::Null,
+            binding: self.binding.clone(),
+            environment: self
+                .values
+                .iter()
+                .map(|(key, value)| (environment_name(key), value.clone()))
+                .collect(),
+        }
+        .into_request()
+    }
+
+    async fn start(&self, execution: u64) -> NodeHandle {
+        self.runtime
+            .start(self.request(execution))
+            .await
+            .assert_value()
+    }
+
+    fn capture(&self) -> Vec<Value> {
+        self.directory
+            .read("capture")
+            .lines()
+            .map(|line| serde_json::from_str(line).assert_value())
+            .collect()
+    }
+}
+
+fn custom_provider_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "COPILOT_PROVIDER_BASE_URL".to_owned(),
+            "https://gateway.example/v1".to_owned(),
+        ),
+        ("COPILOT_PROVIDER_TYPE".to_owned(), "openai".to_owned()),
+        (
+            "COPILOT_PROVIDER_API_KEY".to_owned(),
+            "provider-sensitive-value".to_owned(),
+        ),
+        (
+            "COPILOT_PROVIDER_WIRE_API".to_owned(),
+            "responses".to_owned(),
+        ),
+        (
+            "COPILOT_PROVIDER_WIRE_MODEL".to_owned(),
+            "gateway-model".to_owned(),
+        ),
+        (
+            "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS".to_owned(),
+            "4096".to_owned(),
+        ),
+        (
+            "COPILOT_PROVIDER_HEADERS".to_owned(),
+            "X-Tenant: alpha\\nX-Route: beta".to_owned(),
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn native_local_login_and_context_need_no_declared_token() {
+    let fixture = Fixture::native().await;
+    verified(complete(fixture.start(1).await).await.1);
+}
+
+#[tokio::test]
+async fn unsupported_requests_and_memory_hooks_are_answered_without_failing_the_turn() {
+    let fixture = Fixture::new("dispatch").await;
+    verified(complete(fixture.start(1).await).await.1);
+    let replies = fixture
+        .directory
+        .read("capture.dispatch")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).assert_value())
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 3, "every dispatched request is answered");
+    assert_eq!(replies[0]["id"], 9001);
+    assert_eq!(replies[0]["error"]["code"], -32601);
+    for (reply, identifier) in replies[1..].iter().zip([9002, 9003]) {
+        assert_eq!(reply["id"], identifier);
+        assert!(reply["result"]["output"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn ambient_local_token_crosses_private_rpc_only() {
+    let fixture = Fixture::ambient_token().await;
+    verified(complete(fixture.start(1).await).await.1);
+}
+
+#[tokio::test]
+async fn local_custom_provider_configuration_crosses_private_rpc_only() {
+    let fixture = Fixture::custom_provider().await;
+    verified(complete(fixture.start(1).await).await.1);
+}
+
+#[tokio::test]
+async fn local_provider_key_command_crosses_private_rpc() {
+    let fixture = Fixture::provider_key_command().await;
+    verified(complete(fixture.start(1).await).await.1);
+}
+
+#[tokio::test]
+async fn unsupported_or_oversized_command_environments_fail_before_launch() {
+    for fixture in [
+        Fixture::invalid_command_environment("UNREPRESENTABLE,FIELD", "value".to_owned()).await,
+        Fixture::invalid_command_environment("OVERSIZED_FIELD", "x".repeat(4 * 1024 * 1024 + 1))
+            .await,
+    ] {
+        rejected_before_launch(&fixture).await;
+    }
+}
+
+#[tokio::test]
+async fn default_provider_registry_takes_precedence_over_legacy_environment() {
+    let fixture = Fixture::registry(false, false).await;
+    verified(complete(fixture.start(1).await).await.1);
+    verified(complete(fixture.start(2).await).await.1);
+    let capture = fixture.capture();
+    for message in capture.iter().filter(|message| {
+        matches!(
+            message["method"].as_str(),
+            Some("session.create" | "session.resume")
+        )
+    }) {
+        assert_eq!(message["params"]["providers"][0]["name"], "gateway");
+        assert_eq!(message["params"]["models"][0]["provider"], "gateway");
+    }
+}
+
+#[tokio::test]
+async fn explicit_registry_command_is_translated_to_the_working_singular_protocol() {
+    let fixture = Fixture::registry(true, true).await;
+    verify_two_turns(&fixture).await;
+}
+
+#[tokio::test]
+async fn malformed_and_oversized_provider_registries_fail_closed() {
+    for contents in [
+        b"{not-json".to_vec(),
+        vec![b' '; provider::MAX_REGISTRY_BYTES as usize + 1],
+    ] {
+        let fixture = Fixture::invalid_registry(&contents).await;
+        rejected_before_launch(&fixture).await;
+    }
+}
+
+#[tokio::test]
+async fn declared_copilot_token_suppresses_ambient_provider_configuration() {
+    let fixture = Fixture::declared_token_over_provider().await;
+    verified(complete(fixture.start(1).await).await.1);
+    let created = fixture
+        .capture()
+        .into_iter()
+        .find(|message| message["method"] == "session.create")
+        .assert_value();
+    assert_eq!(created["params"]["gitHubToken"], "declared-copilot-token");
+    assert!(created["params"].get("provider").is_none());
+}
+
+#[tokio::test]
+async fn declared_provider_fields_keep_model_selection_separate_from_capability_mapping() {
+    let fixture = Fixture::declared_provider_overlay().await;
+    verified(complete(fixture.start(1).await).await.1);
+}
+
+#[tokio::test]
+async fn declared_native_settings_overlay_ambient_settings() {
+    let fixture = Fixture::declared_native_setting_overlay().await;
+    verified(complete(fixture.start(1).await).await.1);
+}
+
+async fn complete(
+    handle: NodeHandle,
+) -> (
+    Vec<DurableNodeEvent>,
+    Result<WorkerOutcome, NodeRunnerError>,
+) {
+    complete_with_deadline(handle, Duration::from_secs(30)).await
+}
+
+async fn complete_with_deadline(
+    mut handle: NodeHandle,
+    deadline: Duration,
+) -> (
+    Vec<DurableNodeEvent>,
+    Result<WorkerOutcome, NodeRunnerError>,
+) {
+    let mut output = handle.take_initial_output().assert_value();
+    let mut events = Vec::new();
+    let finished = tokio::time::timeout(deadline, async {
+        tokio::join!(
+            async {
+                while let Ok(event) = output.recv().await {
+                    events.push(event);
+                }
+            },
+            handle.completion()
+        )
+    })
+    .await;
+    if finished.is_err() {
+        handle.cancel();
+        let _ = handle.completion().await;
+    }
+    assert!(
+        finished.is_ok(),
+        "Copilot test timed out; safe events: {events:?}"
+    );
+    let (_, completion) = finished.assert_value();
+    (events, completion.map(|value| value.outcome))
+}
+
+fn method_count(capture: &[Value], method: &str) -> usize {
+    capture
+        .iter()
+        .filter(|message| message["method"] == method)
+        .count()
+}
+
+async fn assert_cancelled(handle: &mut NodeHandle) {
+    handle.cancel();
+    let completion = tokio::time::timeout(Duration::from_secs(10), handle.completion())
+        .await
+        .assert_value();
+    assert_eq!(completion, Err(NodeRunnerError::Cancelled));
+}
+
+async fn verified_events(fixture: &Fixture) -> Vec<DurableNodeEvent> {
+    let (events, outcome) = complete(fixture.start(1).await).await;
+    verified(outcome);
+    events
+}
+
+fn verified(outcome: Result<WorkerOutcome, NodeRunnerError>) {
+    assert!(outcome.is_ok(), "Copilot outcome: {outcome:?}");
+    assert!(
+        matches!(outcome.assert_value(), WorkerOutcome::Verified { output, .. } if output == json!({"answer":42}))
+    );
+}
+
+async fn rejected_before_launch(fixture: &Fixture) {
+    let (events, outcome) = complete(fixture.start(1).await).await;
+    assert!(outcome.is_err(), "safe events: {events:?}");
+    assert!(!fixture.directory.child("capture").exists());
+}
+
+async fn verify_two_turns(fixture: &Fixture) {
+    for execution in [1, 2] {
+        verified(complete(fixture.start(execution).await).await.1);
+    }
+}
+
+#[tokio::test]
+async fn schema_permissions_usage_and_resume_preserve_the_session() {
+    let fixture = Fixture::new("permission").await;
+    let events = verified_events(&fixture).await;
+    assert!(events.iter().any(
+        |event| matches!(event, DurableNodeEvent::TokenUsage(Some(usage))
+        if usage.input_tokens.get() == 7 && usage.output_tokens.get() == 3
+            && usage.cache_read_input_tokens.is_some_and(|value| value.get() == 2)
+            && usage.cache_creation_input_tokens.is_some_and(|value| value.get() == 1))
+    ));
+    let logs = events
+        .iter()
+        .filter_map(|event| match event {
+            DurableNodeEvent::Output { output, .. } => Some(output.text.as_str()),
+            DurableNodeEvent::TokenUsage(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(logs.contains(&"Copilot tool: contract-check"));
+    assert!(
+        logs.iter()
+            .any(|message| message.starts_with("Copilot tool failed: "))
+    );
+    assert!(
+        logs.iter()
+            .all(|message| !message.contains("ignored child output"))
+    );
+    verified(complete(fixture.start(2).await).await.1);
+    let capture = fixture.capture();
+    let created = capture
+        .iter()
+        .find(|message| message["method"] == "session.create")
+        .assert_value();
+    let resumed = capture
+        .iter()
+        .find(|message| message["method"] == "session.resume")
+        .assert_value();
+    assert_eq!(
+        created["params"]["sessionId"],
+        resumed["params"]["sessionId"]
+    );
+    assert!(
+        !fixture
+            .directory
+            .child("workspace")
+            .join(".copilot")
+            .exists()
+    );
+}
+
+#[test]
+fn hosted_adapter_discards_user_only_credentials_and_provider_controls() {
+    let config = CopilotConfig {
+        executable: PathBuf::from("/provider/copilot"),
+        workspace: PathBuf::from("/candidate"),
+        runtime_home: PathBuf::from("/runtime"),
+        local_user: Some(CopilotLocalUser {
+            home: PathBuf::from("/user"),
+            copilot_home: PathBuf::from("/user/.copilot"),
+        }),
+        base_environment: BTreeMap::from([
+            (auth::TOKEN.to_owned(), "private-token".to_owned()),
+            ("GH_TOKEN".to_owned(), "private-alias".to_owned()),
+            (
+                "COPILOT_PROVIDER_BASE_URL".to_owned(),
+                "https://private.example".to_owned(),
+            ),
+            ("COPILOT_OFFLINE".to_owned(), "true".to_owned()),
+            ("SAFE_FIELD".to_owned(), "preserved".to_owned()),
+        ]),
+        local_command_environment: BTreeMap::from([(
+            "COMMAND_SECRET".to_owned(),
+            "private-command-value".to_owned(),
+        )]),
+        search_path: "/usr/bin:/bin".to_owned(),
+        process_pool: HostedProcessPool::hosted_default(),
+    };
+    let debug = format!("{config:?}");
+    assert!(debug.contains("base_environment_fields"));
+    assert!(!debug.contains("private-token"));
+    assert!(!debug.contains("private-command-value"));
+
+    let adapter = CopilotAdapter::new(config);
+    assert!(adapter.config.local_user.is_none());
+    assert_eq!(
+        adapter.config.base_environment,
+        BTreeMap::from([("SAFE_FIELD".to_owned(), "preserved".to_owned())])
+    );
+    assert!(adapter.config.local_command_environment.is_empty());
+    assert!(adapter.local_token.is_none());
+    assert!(adapter.local_provider.is_none());
+    assert!(adapter.runners.is_hosted());
+}
+
+#[tokio::test]
+async fn malformed_output_receives_only_two_corrections_in_the_same_session() {
+    for mode in ["correction", "malformed"] {
+        let fixture = Fixture::new(mode).await;
+        let (events, outcome) = complete(fixture.start(1).await).await;
+        let errors = error_output(&events);
+        let typed = events
+            .iter()
+            .filter(|event| {
+                matches!(event,
+            DurableNodeEvent::Output { output, .. }
+                if output.diagnostic == Some(FailureDiagnosticKind::Failure))
+            })
+            .count();
+        assert_eq!(typed, usize::from(mode == "malformed"));
+        let expected = if mode == "correction" { 1 } else { 3 };
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|line| line
+                    .contains("final output rejected: output $.answer must be a integer"))
+                .count(),
+            expected
+        );
+        if mode == "correction" {
+            verified(outcome);
+        } else {
+            assert_eq!(outcome.assert_value(), WorkerOutcome::malformed());
+        }
+        let capture = fixture.capture();
+        assert_eq!(method_count(&capture, "session.create"), 1);
+        assert_eq!(
+            method_count(&capture, "session.send"),
+            if mode == "correction" { 2 } else { 3 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn grammar_compilation_rate_limit_retries_after_backoff_and_resumes_the_session() {
+    struct HostContext;
+
+    impl crate::native_v2_runner::AgentContextProvider for HostContext {
+        fn context(&self) -> String {
+            "grammar retry host context".to_owned()
+        }
+    }
+
+    let mut fixture = Fixture::new("grammar_rate_limit_once").await;
+    fixture.runtime = fixture
+        .runtime
+        .with_agent_context(Some(Arc::new(HostContext)));
+    let events = verified_events(&fixture).await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        DurableNodeEvent::Output { output, .. }
+            if output.text.contains("Copilot grammar compilation rate limited; retrying")
+    )));
+    let capture = fixture.capture();
+    let prompts = capture
+        .iter()
+        .filter(|message| message["method"] == "session.send")
+        .map(|message| message["params"]["prompt"].as_str().assert_value())
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[0], prompts[1]);
+    assert!(
+        prompts[0].starts_with("Runtime-owned execution context:\ngrammar retry host context\n\n")
+    );
+    assert_eq!(method_count(&capture, "session.create"), 1);
+    assert_eq!(method_count(&capture, "session.resume"), 1);
+    assert_eq!(method_count(&capture, "session.send"), 2);
+    assert_eq!(
+        capture
+            .iter()
+            .find(|message| message["method"] == "session.create")
+            .assert_value()["params"]["sessionId"],
+        capture
+            .iter()
+            .find(|message| message["method"] == "session.resume")
+            .assert_value()["params"]["sessionId"]
+    );
+}
+
+#[tokio::test]
+async fn grammar_compilation_retry_preserves_the_current_correction_prompt() {
+    let fixture = Fixture::new("correction_rate_limit_once").await;
+    let (_, outcome) = complete(fixture.start(1).await).await;
+    verified(outcome);
+
+    let capture = fixture.capture();
+    let sends = capture
+        .iter()
+        .filter(|message| message["method"] == "session.send")
+        .collect::<Vec<_>>();
+    assert_eq!(sends.len(), 3);
+    assert_ne!(sends[0]["params"]["prompt"], sends[1]["params"]["prompt"]);
+    assert_eq!(sends[1]["params"]["prompt"], sends[2]["params"]["prompt"]);
+}
+
+#[tokio::test]
+async fn grammar_compilation_rate_limit_retry_exhaustion_preserves_provider_error() {
+    let fixture = Fixture::new("grammar_rate_limit_always").await;
+    let (events, outcome) = complete(fixture.start(1).await).await;
+    let Err(NodeRunnerError::DriverDetail(error)) = outcome else {
+        panic!("expected the exhausted provider retry to fail: {outcome:?}");
+    };
+    assert!(error.contains("persisted after 3 retries"), "{error}");
+    assert!(
+        error.contains("Grammar compilation rate limit exceeded"),
+        "{error}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                DurableNodeEvent::Output { output, .. }
+                    if output.text.contains("Copilot grammar compilation rate limited; retrying")
+            ))
+            .count(),
+        3
+    );
+    let capture = fixture.capture();
+    assert_eq!(method_count(&capture, "session.send"), 4);
+    assert_eq!(method_count(&capture, "session.resume"), 3);
+}
+
+#[tokio::test]
+async fn grammar_compilation_rate_limit_drain_failure_is_terminal() {
+    let fixture = Fixture::new("grammar_rate_limit_drain_error").await;
+    let (events, outcome) = complete(fixture.start(1).await).await;
+    let Err(NodeRunnerError::DriverDetail(error)) = outcome else {
+        panic!("expected the drain failure to be terminal: {outcome:?}");
+    };
+    assert!(
+        error.contains("Copilot token usage is invalid or out of range"),
+        "{error}"
+    );
+    assert!(error_output(&events).is_empty());
+    assert_eq!(
+        method_count(&fixture.capture(), "session.send"),
+        1,
+        "a drain failure must not be retried as a grammar rate limit"
+    );
+}
+
+#[tokio::test]
+async fn grammar_compilation_rate_limit_cancellation_during_backoff_does_not_resend() {
+    let fixture = Fixture::new("grammar_rate_limit_always").await;
+    let mut handle = fixture.start(1).await;
+    let mut output = handle.take_initial_output().assert_value();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), output.recv_output())
+            .await
+            .assert_value()
+            .assert_value();
+        if event.stream == LiveOutputStream::System
+            && event
+                .text
+                .contains("Copilot grammar compilation rate limited; retrying")
+        {
+            break;
+        }
+    }
+    assert_cancelled(&mut handle).await;
+    assert_eq!(
+        method_count(&fixture.capture(), "session.send"),
+        1,
+        "cancelling during backoff must not start another session.send"
+    );
+}
+
+#[tokio::test]
+async fn fails_closed_on_protocol_identity_and_provider_errors() {
+    for (mode, detail) in [
+        ("version", "is incompatible; install CLI 1.0.86"),
+        ("identity", "Copilot returned a different session"),
+        ("error", "rejected [REDACTED]"),
+        ("http_400", "HTTP 400: Invalid JSON schema"),
+        ("http_400_stderr_grammar", "HTTP 400: Invalid JSON schema"),
+    ] {
+        let fixture = Fixture::new(mode).await;
+        let (events, outcome) = complete(fixture.start(1).await).await;
+        let Err(NodeRunnerError::DriverDetail(error)) = outcome else {
+            panic!("expected provider detail: {outcome:?}");
+        };
+        assert!(error.contains(detail), "missing useful error: {error}");
+        assert!(
+            error_output(&events).is_empty(),
+            "terminal detail must not be emitted twice"
+        );
+        if mode == "version" {
+            assert!(error.contains("stderr: launch note: [REDACTED]"));
+        }
+        assert!(!format!("{events:?} {error}").contains("gho_fake-secret"));
+        if mode == "http_400" || mode == "http_400_stderr_grammar" {
+            assert_eq!(
+                method_count(&fixture.capture(), "session.send"),
+                1,
+                "ordinary HTTP 400 responses must not be retried"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_detach_keeps_the_accepted_answer() {
+    for (mode, detail) in [
+        (
+            "detach_unhandled",
+            "Copilot RPC failed: Unhandled method session.detach",
+        ),
+        ("detach_refused", "Copilot session could not be detached"),
+    ] {
+        let fixture = Fixture::new(mode).await;
+        let (events, outcome) = complete(fixture.start(1).await).await;
+        verified(outcome);
+        assert_eq!(
+            error_output(&events),
+            [format!(
+                "Copilot provider failure: session detach failed after the accepted answer: \
+                 {detail}"
+            )]
+        );
+    }
+}
+
+#[tokio::test]
+async fn closed_input_after_an_accepted_answer_keeps_the_outcome() {
+    for mode in ["closed_input", "closed_input_exit"] {
+        let fixture = Fixture::new(mode).await;
+        let (events, outcome) = complete(fixture.start(1).await).await;
+        verified(outcome);
+        let errors = error_output(&events);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("session detach failed after the accepted answer"));
+        assert_eq!(method_count(&fixture.capture(), "session.send"), 1);
+    }
+}
+
+#[tokio::test]
+async fn detach_keeps_response_validation_and_protocol_failures_fatal() {
+    for (mode, expected) in [
+        ("closed_input_invalid", "Copilot process failed"),
+        ("closed_input_truncated", "stream ended inside a message"),
+        (
+            "detach_invalid_version",
+            "Copilot JSON-RPC version is invalid",
+        ),
+        (
+            "detach_invalid_id",
+            "Copilot RPC response identity is unexpected",
+        ),
+        (
+            "detach_missing_result",
+            "Copilot RPC response must contain exactly one result or error",
+        ),
+        (
+            "detach_missing_success",
+            "Copilot session detach result is invalid",
+        ),
+        (
+            "detach_invalid_success",
+            "Copilot session detach result is invalid",
+        ),
+        ("detach_invalid_error", "Copilot RPC error is invalid"),
+        ("detach_invalid_error_code", "Copilot RPC error is invalid"),
+        (
+            "detach_result_and_error",
+            "Copilot RPC response must contain exactly one result or error",
+        ),
+        (
+            "detach_invalid_event_session",
+            "Copilot event session identity is unexpected",
+        ),
+        (
+            "detach_invalid_usage",
+            "Copilot token usage is invalid or out of range",
+        ),
+    ] {
+        let fixture = Fixture::new(mode).await;
+        let (_, outcome) = complete(fixture.start(1).await).await;
+        assert!(
+            matches!(&outcome, Err(NodeRunnerError::DriverDetail(detail)) if detail.contains(expected)),
+            "{outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validation_errors_keep_the_explanation_and_redact_credentials() {
+    for mode in ["validation_secret", "validation_secret_long"] {
+        let fixture = Fixture::new(mode).await;
+        let (events, outcome) = complete(fixture.start(1).await).await;
+        assert_eq!(outcome.assert_value(), WorkerOutcome::malformed());
+        let errors = error_output(&events);
+        assert_eq!(errors.len(), 3);
+        for error in errors {
+            assert!(error.contains("final output rejected:"));
+            assert!(error.contains("unknown field"));
+            assert!(error.contains("[REDACTED]"));
+            assert!(!error.contains("gho_fak"));
+            assert!(!error.contains("Response contract:"));
+            assert!(error.len() <= 8 * 1024);
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_failure_returns_detail_with_no_durable_consumer() {
+    let fixture = Fixture::new("version").await;
+    let mut handle = fixture.start(1).await;
+    drop(handle.take_initial_output().assert_value());
+    let error = handle.completion().await.assert_error();
+    assert!(matches!(error, NodeRunnerError::DriverDetail(ref detail)
+        if detail.contains("is incompatible; install CLI 1.0.86")));
+    assert!(!error.to_string().contains("gho_fake-secret"));
+}
+
+fn error_output(events: &[DurableNodeEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DurableNodeEvent::Output { output, .. } if output.stream == LiveOutputStream::Error => {
+                Some(output.text.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn startup_failures_return_actionable_details() {
+    let directory = TestDirectory::new("copilot-missing-executable");
+    let missing = directory.child("missing-copilot");
+    let fixture = Fixture::with_executable(
+        directory,
+        missing,
+        BTreeMap::from([(auth::TOKEN.to_owned(), "gho_fake-secret".to_owned())]),
+        INSTRUCTIONS,
+    )
+    .await;
+    assert_startup_error(
+        &fixture,
+        "process launch failed before start",
+        "gho_fake-secret",
+    )
+    .await;
+
+    let fixture = Fixture::invalid_registry(b"{invalid-secret-registry").await;
+    assert_startup_error(
+        &fixture,
+        "Copilot provider registry is invalid",
+        "invalid-secret-registry",
+    )
+    .await;
+}
+
+async fn assert_startup_error(fixture: &Fixture, detail: &str, secret: &str) {
+    let (events, outcome) = complete(fixture.start(1).await).await;
+    let Err(NodeRunnerError::DriverDetail(error)) = outcome else {
+        panic!("expected startup detail: {outcome:?}");
+    };
+    assert!(error.contains(detail));
+    assert!(error_output(&events).is_empty());
+    assert!(!format!("{events:?} {error}").contains(secret));
+    assert!(!fixture.directory.child("capture").exists());
+}
+
+#[tokio::test]
+async fn cancellation_preserves_usage_and_reaps_the_runtime() {
+    let fixture = Fixture::new("cancel").await;
+    let mut handle = fixture.start(1).await;
+    let mut output = handle.take_initial_output().assert_value();
+    let usage = output.recv_usage().await.assert_value().assert_value();
+    assert_eq!(usage.input_tokens.get(), 7);
+    assert_cancelled(&mut handle).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly authorized live Copilot user token and pinned CLI"]
+async fn live_user_auth_and_schema() {
+    let token = std::env::var("ZEROSHOT_COPILOT_TEST_TOKEN")
+        .assert_value_with("live token must be supplied");
+    let executable = std::env::var_os("ZEROSHOT_COPILOT_TEST_EXECUTABLE").assert_value();
+    let fixture = Fixture::with_executable(
+        TestDirectory::new("copilot-live"),
+        PathBuf::from(executable),
+        BTreeMap::from([(auth::TOKEN.to_owned(), token)]),
+        INSTRUCTIONS,
+    )
+    .await;
+    verify_two_turns(&fixture).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly authorized live Copilot user token and pinned CLI"]
+async fn live_tools_do_not_inherit_or_persist_the_user_token() {
+    let token = std::env::var("ZEROSHOT_COPILOT_TEST_TOKEN")
+        .assert_value_with("live token must be supplied");
+    let executable = std::env::var_os("ZEROSHOT_COPILOT_TEST_EXECUTABLE").assert_value();
+    let fixture = Fixture::with_executable(TestDirectory::new("copilot-live-tools"), PathBuf::from(executable),
+        BTreeMap::from([(auth::TOKEN.to_owned(), token.clone())]),
+        "Use the shell tool to verify that none of COPILOT_GITHUB_TOKEN, COPILOT_GITHUB_TOKEN_EXPIRES_AT, \
+        COPILOT_SDK_AUTH_TOKEN, GH_TOKEN, or GITHUB_TOKEN are present in its environment. \
+        Write ok to credential-isolation.txt only if all are absent. Never print environment values. \
+        Then return answer 42 using the required schema.").await;
+    let (events, outcome) =
+        complete_with_deadline(fixture.start(1).await, Duration::from_secs(120)).await;
+    verified(outcome);
+    assert!(
+        fixture
+            .directory
+            .child("workspace/credential-isolation.txt")
+            .exists(),
+        "Copilot did not execute the requested tool; safe events: {events:?}"
+    );
+    assert_eq!(
+        fixture
+            .directory
+            .read("workspace/credential-isolation.txt")
+            .trim(),
+        "ok"
+    );
+    assert_no_persisted_token(&fixture.directory.child("runtime"), token.as_bytes());
+}
+
+fn assert_no_persisted_token(directory: &std::path::Path, token: &[u8]) {
+    for entry in std::fs::read_dir(directory).assert_value() {
+        let entry = entry.assert_value();
+        let kind = entry.file_type().assert_value();
+        if kind.is_dir() {
+            assert_no_persisted_token(&entry.path(), token);
+        }
+        if kind.is_file() {
+            let contents = std::fs::read(entry.path()).assert_value();
+            assert!(
+                !contents.windows(token.len()).any(|bytes| bytes == token),
+                "Copilot persisted a user token"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_cleanup_preserves_an_already_received_provider_error() {
+    let fixture = Fixture::new("error_cleanup").await;
+    let mut handle = fixture.start(1).await;
+    let mut output = handle.take_initial_output().assert_value();
+    tokio::time::timeout(Duration::from_secs(5), output.wait_until_saturated())
+        .await
+        .assert_value();
+    handle.cancel();
+    let (events, completion) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            async {
+                let mut events = Vec::new();
+                while let Ok(event) = output.recv().await {
+                    events.push(event);
+                }
+                events
+            },
+            handle.completion()
+        )
+    })
+    .await
+    .assert_value();
+    let error = completion.assert_error();
+    assert!(
+        matches!(&error, NodeRunnerError::DriverDetail(detail)
+        if detail.contains("rejected [REDACTED]")),
+        "{error:?}"
+    );
+    assert!(!format!("{events:?} {error}").contains("gho_fake-secret"));
+    assert_eq!(
+        events.len(),
+        1027,
+        "all trailing usage must survive cleanup"
+    );
+    assert!(
+        error_output(&events).is_empty(),
+        "terminal detail must not be duplicated"
+    );
+}
+
+#[tokio::test]
+async fn unconfirmed_cleanup_preserves_a_redacted_bounded_provider_diagnostic() {
+    let (_, control, mut output) = crate::native_v2_runner::test_support::control();
+    let secret = "gho_private-cleanup-cause";
+    let detail = format!(
+        "provider rejected {secret} \u{1b} {} final cause",
+        "λ🦀".repeat(5000)
+    );
+    let outcome = Err(NodeRunnerError::DriverDetail(detail));
+    assert_eq!(
+        rpc_cleanup_failure(&outcome, &[secret.to_owned()], &control).await,
+        NodeRunnerError::CleanupUnconfirmed
+    );
+    let DurableNodeEvent::Output {
+        output: diagnostic, ..
+    } = output.recv().await.assert_value()
+    else {
+        panic!("expected provider diagnostic before cleanup settlement");
+    };
+    assert_eq!(diagnostic.diagnostic, Some(FailureDiagnosticKind::Failure));
+    assert_eq!(diagnostic.stream, LiveOutputStream::Error);
+    assert!(diagnostic.text.contains("provider rejected [REDACTED]"));
+    assert!(diagnostic.text.contains("final cause"));
+    assert!(diagnostic.text.len() <= 8192);
+    assert!(!diagnostic.text.contains(secret));
+    assert!(!diagnostic.text.contains('\u{1b}'));
+}
+
+#[tokio::test]
+async fn final_malformed_validation_detail_survives_capsule_transport() {
+    use crate::native_v2_capsule::{NativeCapsuleNodeEndpoint, RemoteCapsuleNodeRunner};
+    let fixture = Fixture::new("validation_secret_long").await;
+    let endpoint = Arc::new(NativeCapsuleNodeEndpoint::new(Arc::new(
+        fixture.runtime.clone(),
+    )));
+    let proxy = RemoteCapsuleNodeRunner::new(endpoint);
+    let handle = proxy.start(fixture.request(1)).await.assert_value();
+    let (events, outcome) = complete(handle).await;
+    assert_eq!(outcome.assert_value(), WorkerOutcome::malformed());
+    let failures = events
+        .iter()
+        .filter_map(|event| match event {
+            DurableNodeEvent::Output { output, .. }
+                if output.diagnostic == Some(FailureDiagnosticKind::Failure) =>
+            {
+                Some(output)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].text.contains("final output rejected:"));
+    assert!(failures[0].text.contains("[REDACTED]"));
+    assert!(!failures[0].text.contains("gho_fak"));
+    assert!(failures[0].text.len() <= 8192);
+}

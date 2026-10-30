@@ -466,6 +466,9 @@ impl NativeV2TargetServer {
         let mut document = TargetDiscoveryDocument::direct(self.access.authentication())
             .with_node_runtime_lanes()
             .with_decision_models();
+        if let Some(catalog) = self.target.runtime_harnesses() {
+            document = document.with_runtime_harnesses(catalog);
+        }
         if self.target.supports_git_transport() {
             document = document.with_git_transport();
         }

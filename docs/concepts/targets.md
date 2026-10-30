@@ -7,6 +7,16 @@ description: 'Run the same graph locally, on a self-hosted Docker target or on a
 A target owns source preparation and the processes that execute graph nodes; it also stores durable
 run state and resolves connections. The graph protocol stays the same when the target changes.
 
+Targets advertise their enabled harness/provider pairs through the
+`openengine.runtime-harnesses/v1` discovery extension. The CLI checks every selected lane before
+requesting an access token or submitting a run or profile, and the target enforces its catalog
+again during admission. Older targets without this extension accept only the established core
+harnesses through client preflight.
+
+Official local builds include contributed adapters; Platform and the default target image enable
+only core adapters. See [Harness adapters](../project/harness-adapters.md) for availability and
+provider support.
+
 ## Local controller
 
 Omit `--target` to work in an existing local folder. `--cwd FOLDER` selects the folder for one run;
@@ -28,9 +38,9 @@ another folder returns a conflict rather than a run from the first folder.
 Local execution is the only mode that mutates the caller's existing folder; each selected
 installed harness runs as the current user. A plan with
 [per-node lanes](../reference/runtime-plan.md#per-node-lanes) needs every lane's CLI installed. The
-native `codex`/`openai`, `claude`/`anthropic`, and `copilot`/`github` lanes also need that CLI
-signed in; other lanes need their provider's
-[connection values](../reference/runtime-plan.md#connections). Before the controller starts,
+adapter declares whether its lane can reuse the CLI's native login; otherwise it needs the provider's
+[connection values](../reference/runtime-plan.md#connections). Declared credentials take precedence
+over native login state. Before the controller starts,
 `zeroshot run` and `zeroshot resume` check that each lane's executable is on `PATH`; they do not
 check login state, so a missing login fails at that lane's first turn.
 
@@ -70,7 +80,7 @@ command translated to the singular RPC contract uses its authored `modelId` as t
 Contained targets use a private Copilot home and require the canonical `COPILOT_GITHUB_TOKEN`
 connection instead.
 
-Local Pi runs use the current user's `~/.pi/agent` for a `pi/anthropic` or `pi/openai` lane, which
+Local Pi runs use the current user's `~/.pi/agent` for a `pi/anthropic`, `pi/openai` or `pi/github` lane, which
 reuses a stored Pi login. Any other Pi lane, a declared credential, or a caller-owned endpoint
 instead receives a private agent directory so no ambient catalog or credential is inherited. A
 declared or ambient `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, or `OPENAI_API_BASE` becomes a Pi
@@ -151,7 +161,8 @@ available when a later backup fails.
 ## Direct target
 
 A direct target exposes Zeroshot's HTTP and OECP contracts without application-level authentication.
-The released container includes Zeroshot plus pinned Codex, Claude, GitHub Copilot, and Pi harnesses.
+The released container includes Zeroshot plus the pinned core harness CLIs listed in
+[Harness adapters](../project/harness-adapters.md).
 A run can mix their lanes; its connection requirements are then the union over its nodes, such as
 `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` for a Codex worker with Claude Code reviewers.
 

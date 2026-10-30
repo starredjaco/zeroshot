@@ -226,6 +226,14 @@ fn validate_model(value: &str) -> Result<(), NativeV2RunValueError> {
     )
 }
 
+fn validate_runtime_id(value: &str) -> Result<(), NativeV2RunValueError> {
+    validate_non_control_bytes(
+        value,
+        128,
+        "runtime identifier must be 1..=128 non-control bytes",
+    )
+}
+
 fn validate_environment_name(value: &str) -> Result<(), NativeV2RunValueError> {
     let mut bytes = value.bytes();
     let first = bytes
@@ -322,6 +330,20 @@ native_v2_string_kind!(
     SourceRevisionId,
     validate_revision,
     json_schema!({ "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$" })
+);
+native_v2_string_kind!(
+    HarnessIdKind,
+    HarnessId,
+    validate_runtime_id,
+    json_schema!({ "type": "string", "minLength": 1, "maxLength": 128,
+        "pattern": r"^[^\u0000-\u001f\u007f-\u009f]+$" })
+);
+native_v2_string_kind!(
+    ProviderIdKind,
+    ProviderId,
+    validate_runtime_id,
+    json_schema!({ "type": "string", "minLength": 1, "maxLength": 128,
+        "pattern": r"^[^\u0000-\u001f\u007f-\u009f]+$" })
 );
 native_v2_string_kind!(
     ModelIdKind,
@@ -432,6 +454,13 @@ pub use source::*;
 #[serde(rename_all = "snake_case")]
 pub enum CopilotProvider {
     Github,
+    #[serde(rename = "openai")]
+    OpenAi,
+    Anthropic,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    Gateway,
+    Bedrock,
 }
 
 #[derive(
@@ -481,6 +510,7 @@ pub enum ClaudeProvider {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PiProvider {
+    Github,
     Anthropic,
     #[serde(rename = "openai")]
     OpenAi,
@@ -496,63 +526,98 @@ impl PiProvider {
     /// environment, so native reuse means exactly that stored credential.
     #[must_use]
     pub const fn natively_authenticated(self) -> bool {
-        matches!(self, Self::Anthropic | Self::OpenAi)
+        matches!(self, Self::Anthropic | Self::OpenAi | Self::Github)
     }
 }
 
-/// One harness and provider pair: the run-level default, or an agent node's override.
+/// One opaque harness/provider pair. Installed adapters own compatibility and execution policy.
 #[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
-#[serde(deny_unknown_fields, tag = "harness", rename_all = "snake_case")]
-pub enum RuntimeLane {
-    Copilot { provider: CopilotProvider },
-    Codex { provider: CodexProvider },
-    Claude { provider: ClaudeProvider },
-    Pi { provider: PiProvider },
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLane {
+    pub harness: HarnessId,
+    pub provider: ProviderId,
 }
 
 impl RuntimeLane {
-    /// Wire name of the harness, which is also the name of the executable this lane spawns.
-    #[must_use]
-    pub const fn harness_name(self) -> &'static str {
-        match self {
-            Self::Copilot { .. } => "copilot",
-            Self::Codex { .. } => "codex",
-            Self::Claude { .. } => "claude",
-            Self::Pi { .. } => "pi",
-        }
+    pub fn new(
+        harness: impl Into<String>,
+        provider: impl Into<String>,
+    ) -> Result<Self, NativeV2RunValueError> {
+        Ok(Self {
+            harness: HarnessId::new(harness)?,
+            provider: ProviderId::new(provider)?,
+        })
     }
 
-    /// Wire name of the provider.
     #[must_use]
-    pub const fn provider_name(self) -> &'static str {
-        match self {
-            Self::Copilot {
-                provider: CopilotProvider::Github,
-            } => "github",
-            Self::Codex { provider } => match provider {
-                CodexProvider::OpenAi => "openai",
-                CodexProvider::OpenRouter => "openrouter",
-                CodexProvider::Gateway => "gateway",
-                CodexProvider::Bedrock => "bedrock",
-            },
-            Self::Claude { provider } => match provider {
-                ClaudeProvider::Anthropic => "anthropic",
-                ClaudeProvider::OpenRouter => "openrouter",
-                ClaudeProvider::Gateway => "gateway",
-                ClaudeProvider::Bedrock => "bedrock",
-            },
-            Self::Pi { provider } => match provider {
-                PiProvider::Anthropic => "anthropic",
-                PiProvider::OpenAi => "openai",
-                PiProvider::OpenRouter => "openrouter",
-                PiProvider::Gateway => "gateway",
-                PiProvider::Bedrock => "bedrock",
-            },
-        }
+    pub fn harness_name(&self) -> &str {
+        self.harness.as_str()
+    }
+
+    #[must_use]
+    pub fn provider_name(&self) -> &str {
+        self.provider.as_str()
     }
 }
+
+macro_rules! native_provider_names {
+    ($provider:ty, {$($variant:path => $name:literal),+ $(,)?}) => {
+        impl $provider {
+            #[must_use]
+            pub const fn name(self) -> &'static str {
+                match self { $($variant => $name,)+ }
+            }
+        }
+
+        impl std::str::FromStr for $provider {
+            type Err = NativeV2RunValueError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                match value {
+                    $($name => Ok($variant),)+
+                    _ => Err(NativeV2RunValueError("provider is unsupported by this harness")),
+                }
+            }
+        }
+
+        impl From<$provider> for ProviderId {
+            fn from(value: $provider) -> Self {
+                Self(value.name().to_owned(), PhantomData)
+            }
+        }
+    };
+}
+
+native_provider_names!(CopilotProvider, {
+    CopilotProvider::Github => "github",
+    CopilotProvider::OpenAi => "openai",
+    CopilotProvider::Anthropic => "anthropic",
+    CopilotProvider::OpenRouter => "openrouter",
+    CopilotProvider::Gateway => "gateway",
+    CopilotProvider::Bedrock => "bedrock",
+});
+native_provider_names!(CodexProvider, {
+    CodexProvider::OpenAi => "openai",
+    CodexProvider::OpenRouter => "openrouter",
+    CodexProvider::Gateway => "gateway",
+    CodexProvider::Bedrock => "bedrock",
+});
+native_provider_names!(ClaudeProvider, {
+    ClaudeProvider::Anthropic => "anthropic",
+    ClaudeProvider::OpenRouter => "openrouter",
+    ClaudeProvider::Gateway => "gateway",
+    ClaudeProvider::Bedrock => "bedrock",
+});
+native_provider_names!(PiProvider, {
+    PiProvider::Github => "github",
+    PiProvider::Anthropic => "anthropic",
+    PiProvider::OpenAi => "openai",
+    PiProvider::OpenRouter => "openrouter",
+    PiProvider::Gateway => "gateway",
+    PiProvider::Bedrock => "bedrock",
+});
 
 impl fmt::Display for RuntimeLane {
     /// Prints `harness/provider` with the wire names, for example `claude/anthropic`.

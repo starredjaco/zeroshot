@@ -134,6 +134,63 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Each full-v1 loop round starts with fresh error, signal, group, and output-channel facts for its
   body at that map scope. Caller state persists across rounds; internal visit markers persist for
   durable replay. Final-round facts replace older facts when the loop returns to its parent.
+- Harness integration lives in `harnesses/`: one registry supplies pure descriptors, provider
+  requirements, executable lookup and factories for every adapter. Maintained implementations live
+  in `harnesses/adapters/core`; contributions live in `harnesses/adapters/contributed` and register
+  explicitly. Protocol harness/provider IDs are bounded opaque strings; registry admission owns
+  pair compatibility. Each adapter owns its native environment allowlist and home/path expansion;
+  shared process helpers keep only common environment and transport mechanics. Existing public
+  core module paths remain available for embedders. Core and contributed adapters implement the same
+  complete execution and Active Memory contracts. The distinction controls distribution and maintenance
+  ownership only.
+  Native memory hook/extension installation belongs to the adapter; shared memory owns the broker,
+  frozen recall budgets, receipts and maintenance. Contributions never acquire a separate runtime
+  or reduced feature path. Official local builds enable `contributed-harnesses`; target images and
+  Platform dependencies disable default features, and target admission independently uses the
+  core-only registry even when compiled into a local binary. Targets advertise enabled pairs via
+  the separate `openengine.runtime-harnesses/v1` discovery extension; older targets without it
+  retain legacy core submissions, while contributed lanes require positive advertisement.
+  Local adapters preserve native configuration discovery when provider credentials are declared.
+  OpenCode retains its original HOME/XDG paths and native managed, global/project, plugin and MCP
+  resources. A private dependency-free native plugin applies declared authentication or endpoints
+  to the selected provider after native resolution and checks outgoing authentication headers
+  after native header hooks and before the SDK transport. Arbitrary native custom transport code
+  remains trusted executable code and may replace HTTP behavior.
+  Mask only the selected stored login in private process state; preserve unrelated native auth for
+  well-known discovery. The native `auth.set` wrapper supplies its original file or inline authority only within
+  that write's async scope, so concurrent model requests retain selected authentication. OpenCode owns
+  auth-file writes. The GitHub lane seeds private native OAuth state and retains its native provider
+  loader, endpoint metadata and request authentication; declared tokens never replace saved logins.
+  Local OpenCode keeps native permissions and adds no `--auto`: native configuration inspection
+  starts background dependency work, so use the shared unavailable-inspection fallback without a
+  probe, custom policy parser or cache-lock management. Contained OpenCode adds `--auto` in its
+  disposable capsule. Active Memory installs a separate native plugin alongside user plugins.
+  Explicit `OPENCODE_PURE=true` conflicts with declared authentication because it disables the
+  required provider overlay.
+  Hermes uses its installed canonical executable's interpreter and native `AIAgent`/configuration
+  factories in a private process, without starting or attaching its shared gateway. A scoped import
+  hook preserves native startup; `--version --help` fails closed if that hook is unavailable.
+  Credentials cross private stdin after a versioned handshake. Local profile selection, managed
+  settings, plugins, MCP, instructions and permissions remain native. The owned agent, auxiliary
+  and delegation factories keep declared credentials authoritative through refresh and retries;
+  explicit foreign provider routes refuse before authentication. Native login retains native refresh.
+  GitHub binds the native source-token resolver while preserving native exchange, account endpoints,
+  refresh and retries; declared credentials use a private native token cache. Bedrock binds private
+  native AWS sessions for Converse, Anthropic and Mantle clients, preserving native signing and
+  credential refresh. Declared AWS authentication suppresses ambient alternatives and pins declared
+  region; native profiles and plugin discovery keep their original paths.
+  Structured corrections share one runtime; node revisits follow native compression tips in a
+  private native session database. Bind the original native profile through execution and cleanup
+  so private database placement never changes SOUL or skills lookup. Captured shell values remain private until native configuration
+  requests their names. Declared connections override native dotenv values; provider credentials
+  remain private and are available to explicit native configuration lookups.
+  Cancellation requests native interruption and confirms terminal jobs, Python kernels, owned
+  background work, LSP and MCP cleanup before the shared process-kill fallback. A native cleanup acknowledgement is required
+  in addition to process containment evidence. Remote kernel retirement retains known ownership
+  until checked native transport confirms settlement; inaccessible evidence stays unknown.
+  Caller-selected remote backends retain native containment guarantees. Native token deltas remain visible; unreported
+  auxiliary or child work marks totals incomplete. Active Memory attaches native model-facing
+  notices after tool-result bookkeeping, preserving native transforms and durable messages.
 - Model identifiers are opaque provider-owned strings. Do not infer a harness from a provider/model,
   maintain runtime model catalogs, or validate provider availability. Admission may reject only known
   incompatible harness/provider pairs. A caller may declare optional bounded `contextWindow` and
@@ -181,7 +238,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   each node's effective lane; shared model edits are available only within one lane. Review-loop
   reviewers retain the writer's authored lane and model, but not its credentials or session.
 - The `gateway` provider resolves `GATEWAY_BASE_URL` and `GATEWAY_API_KEY` through named
-  connections. Codex uses Responses with bearer authentication; Claude uses Messages with
+  connections. Pi, Copilot, OpenCode and Hermes additionally require an authored `GATEWAY_API`
+  selecting their native Responses, Completions or Messages transport; they never infer it from a model.
+  Codex uses Responses with bearer authentication; Claude uses Messages with
   `x-api-key`. Preserve caller-owned base paths and model identifiers without protocol detection.
 - Local Codex `openai` runs inherit the user's configured model provider and transport, including
   OpenAI-compatible proxies. Preserve declared `OPENAI_API_KEY` for custom provider authentication
@@ -199,7 +258,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   transport selectors cannot contradict an explicitly selected OpenRouter, Bedrock, or gateway lane.
 - Provider access defaults are materialized from the authored runtime at the execution-placement
   boundary. Omitted connections remain omitted in author-owned local profiles. Local Codex/OpenAI,
-  Claude/Anthropic, Copilot/GitHub, Pi/Anthropic, and Pi/OpenAI lanes reuse native login state
+  Claude/Anthropic, Copilot/GitHub and its OpenAI/Anthropic/OpenRouter BYOK lanes, Pi/Anthropic,
+  Pi/OpenAI, Pi/GitHub, and native-local contributed lanes reuse native login state
   without inventing a connection requirement; contained placements and non-native lanes add only their canonical
   missing requirements. Explicit
   compatible authored fields always win. Hosts use
@@ -240,11 +300,11 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   dependencies are reported with environment evidence rather than unrelated code repair requests.
   Hosting embedders may attach an `AgentContextProvider` through `ProductionHostingConfig`.
   The runner samples its nonsecret context for every agent execution, including node-instance
-  revisits and auxiliary agents, and all four harnesses prepend it through the shared invocation
+  revisits and auxiliary agents, and all registered harnesses prepend it through the shared invocation
   prompt methods. Host context stays outside authored graphs, runtime plans, durable invocations,
   and checkpoints. Default local/direct composition attaches no host context.
-  Shared inspection owns bounded JSONL exchange and process cleanup. Each harness owns its native
-  policy parser and `apply_permission_default` entry point; `PermissionPolicy` distinguishes unset,
+  Shared inspection owns bounded JSONL exchange and process cleanup. Each harness owns native
+  permission handling and any parser it needs; `PermissionPolicy` distinguishes unset,
   configured, and unavailable inspection results. Codex browser/computer access controls and explicit
   approval-review features count as authored policy.
 - The local target registry initializes `platform` at `https://api.app.zeroshot.sh` with a persistent hosted device identity.
@@ -389,8 +449,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   exists. Structured output receives at most two correction turns before `malformed`.
 - Pi drives one `pi --mode json` process per turn, with the node prompt on stdin so a large input
   payload can never exceed the platform argument limit. Model identifiers stay caller-owned and Pi
-  owns their resolution. Its provider lanes are `anthropic`, `openai`, `openrouter`, `bedrock`, and
-  `gateway`; the gateway lane synthesizes a private `models.json` that registers its own Pi provider
+  owns their resolution. Its provider lanes are `anthropic`, `openai`, `openrouter`, `bedrock`,
+  `github`, and `gateway`; the gateway lane synthesizes a private `models.json` that registers its own Pi provider
   against the caller's base URL and references the declared key by interpolation, so no secret enters
   the file and no Zeroshot-owned model catalog exists. It registers its own provider rather than
   retargeting a built-in one because Pi honors `api`, `apiKey`, and `baseUrl` on a registered
@@ -411,7 +471,10 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   never outranks the declared one. An endpoint override interpolates the lane's key field only when
   the connection supplies it; the anthropic override omits `apiKey` when `ANTHROPIC_API_KEY` is
   absent so Pi's own `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_OAUTH_TOKEN` environment auth still resolves.
-  Pi home overrides resolve native tilde shorthand against the captured user's home before
+  The `github` lane maps to native `github-copilot`; a declared GitHub user token seeds a private
+  native OAuth entry, never raw model authentication. Pi owns exchange and refresh, and the raw
+  declared token is removed from the process/tool environment. Native-login runs keep their agent
+  directory. Pi home overrides resolve native tilde shorthand against the captured user's home before
   detachment and leave `file://` decoding to Pi. A native-local lane reuses
   the user's stored Pi login from its agent directory; every other lane receives a private agent
   directory so no ambient configuration, catalog, or credential is inherited. Session identity is a
@@ -421,13 +484,17 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   success and exit status alone is insufficient. Pi exposes no response-schema flag, so the Pi lane
   carries the machine-readable provider schema in the prompt rather than the `NodeResponseContract`
   object, and correction turns restate that same schema so the retries converge. The schema dialect
-  follows the lane's wire protocol: the `anthropic` and `bedrock` lanes and a gateway
+  follows the lane's wire protocol: the `anthropic`, `bedrock`, and `github` lanes and a gateway
   `anthropic-messages` protocol use the neutral schema, while the `openai` and `openrouter` lanes
   and the gateway `openai-responses`/`openai-completions` protocols use OpenAI strict mode; a
   gateway lane must name its protocol through `GATEWAY_API`. Local validation remains authoritative
   and corrections stay bounded to two turns.
-- Copilot uses the pinned CLI's headless JSON-RPC protocol 3, with provider `github` and
-  caller-owned model IDs. Remote session synchronization is disabled with `--sync-session off`.
+- Copilot uses the pinned CLI's headless JSON-RPC protocol 3 and caller-owned model IDs. Its
+  `github` lane retains native login; explicit OpenAI, Anthropic and OpenRouter lanes use native
+  BYOK; gateway selects its native API explicitly. Bedrock uses native BYOK Responses with the
+  regional AWS OpenAI-compatible endpoint and bearer credential, without a signing shim.
+  Canonical local credentials and endpoints stay private, behind declared values. Endpoint aliases
+  share precedence; switching endpoints clears stored headers before applying declared ones. Remote session synchronization is disabled with `--sync-session off`.
   Structured output and corrections share one session; node-instance
   revisits resume from the current user's `COPILOT_HOME` locally and a private home when contained.
   Local runs reuse stored Copilot login, host/auth endpoint settings, and supported custom-provider
@@ -448,8 +515,8 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
   is supplied unchanged to the headless process and normally to its RPC session while provider
   `modelId` capability and wire-model mappings remain intact. Translating a selected registry
   command uses that registry entry's authored `modelId` for the singular RPC session; the admitted
-  `provider/id` remains the unchanged process-level registry selection. Contained runs require
-  `COPILOT_GITHUB_TOKEN`. Optional
+  `provider/id` remains the unchanged process-level registry selection. Contained GitHub lanes require
+  `COPILOT_GITHUB_TOKEN`; BYOK lanes require their canonical provider fields. Optional
   `COPILOT_GITHUB_TOKEN_EXPIRES_AT` is Unix seconds;
   expiring credentials use the runtime resolver callback, validate the configured GitHub host, and
   must retain more than one hour. Present but empty or malformed declared credentials fail closed
@@ -1039,8 +1106,9 @@ with `npm i -g @the-open-engine-company/zeroshot` or build `zeroshot` with Cargo
 - Python test doubles use `openengine_cluster_testkit::fixture::python3_script`, which resolves
   the test PATH's actual interpreter before entering a pinned or cleared child environment.
 - `.opcore.json` owns the full-source Opcore policy. `.github/workflows/opcore.yml` runs the Fast
-  and native Rust providers on every PR and main commit. Its two exact PowerShell exclusions reflect
-  unsupported parsing; the Windows native CI lane still runs those scripts.
+  provider and Cargo with warnings denied on every PR and main commit. Cargo uses the complete checkout
+  because Opcore's Rust snapshot omits embedded Python assets. The two exact PowerShell exclusions
+  reflect unsupported parsing; the Windows native CI lane still runs those scripts.
 - Preserve bounded values, explicit overflow, cancellation safety, and exact source provenance at
   every public boundary.
 - Add focused tests beside the owning crate/module.

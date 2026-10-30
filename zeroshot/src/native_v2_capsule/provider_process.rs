@@ -22,10 +22,8 @@ use crate::worker_catalog::ReasoningEffort;
 
 mod environment;
 pub(crate) use environment::{
-    CLAUDE_LOCAL_ENVIRONMENT, CODEX_LOCAL_ENVIRONMENT, COPILOT_LOCAL_ENVIRONMENT,
-    PI_LOCAL_ENVIRONMENT, LocalHarnessEnvironment, current_process_environment,
-    extend_declared_environment, merge_local_environment, private_local_values,
-    provider_redactions,
+    LocalHarnessEnvironment, current_process_environment, extend_declared_environment,
+    merge_local_environment, private_local_values, provider_redactions,
 };
 pub(crate) mod text;
 pub(crate) mod turn;
@@ -196,8 +194,19 @@ pub(crate) async fn open_provider_process(
     command: ProcessSessionCommand,
     control: &DriverControl,
 ) -> Result<Result<ProviderProcess, ProcessRunnerError>, NodeRunnerError> {
+    open_provider_process_with_cancellation(files, command, control, control.cancellation()).await
+}
+
+/// Adapters with native detached jobs first request and confirm native cleanup, then trip their
+/// bounded kill signal. Other adapters retain the ordinary immediate cancellation behavior.
+pub(crate) async fn open_provider_process_with_cancellation(
+    files: Arc<ProviderExecutionFiles>,
+    command: ProcessSessionCommand,
+    control: &DriverControl,
+    cancellation: crate::execution::driver::DriverCancellation,
+) -> Result<Result<ProviderProcess, ProcessRunnerError>, NodeRunnerError> {
     files.begin_process();
-    match files.runner.open(command, control.cancellation()).await {
+    match files.runner.open(command, cancellation).await {
         Ok(process) => Ok(Ok(ProviderProcess::new(process, files))),
         Err(error) => {
             if error.launch_evidence() == ProcessLaunchEvidence::MayHaveStarted {
@@ -240,6 +249,44 @@ macro_rules! impl_provider_node_session {
 }
 
 pub(crate) use impl_provider_node_session;
+
+/// Agent sessions share role admission while each adapter constructs its native session state.
+macro_rules! impl_provider_session_factory {
+    ($adapter:ty, $session:expr) => {
+        #[async_trait::async_trait]
+        impl crate::native_v2_runner::SessionFactory for $adapter {
+            async fn open(
+                &self,
+                invocation: &crate::native_v2_contract::NodeInvocation,
+                _environment: &crate::native_v2_runner::ResolvedEnvironment,
+            ) -> Result<
+                std::sync::Arc<dyn crate::native_v2_runner::NodeSession>,
+                crate::native_v2_runner::NodeRunnerError,
+            > {
+                if !matches!(
+                    invocation.binding,
+                    crate::native_v2_contract::NodeRuntimeBinding::Agent { .. }
+                ) {
+                    return Err(crate::native_v2_runner::NodeRunnerError::SessionOpen);
+                }
+                Ok(std::sync::Arc::new($session))
+            }
+        }
+    };
+}
+
+pub(crate) use impl_provider_session_factory;
+
+/// Drivers resolve only the session type owned by their admitted lane's factory.
+pub(crate) fn invocation_session<T: crate::native_v2_runner::NodeSession>(
+    invocation: &DriverInvocation,
+) -> Result<&T, NodeRunnerError> {
+    invocation
+        .session
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or(NodeRunnerError::Driver)
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum ClosedSessionFailure {
