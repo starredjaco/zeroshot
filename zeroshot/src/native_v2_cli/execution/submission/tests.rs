@@ -414,6 +414,7 @@ async fn wave8_cli_contract_validate_only_preflight_materializes_without_backend
     let run = RunCommand {
         cwd: None,
         source_connection: None,
+        source_forge: None,
 
         environment: None,
         target: None,
@@ -464,6 +465,140 @@ async fn wave8_cli_contract_validate_only_preflight_materializes_without_backend
                 .assert_value()
                 .is_none()
         );
+    }
+}
+
+fn named_validation_command(
+    directory: &std::path::Path,
+    template: BuiltinGraphTemplate,
+    extra: &[&str],
+) -> RunCommand {
+    let input = directory.join("validation-input.json");
+    let runtime = directory.join("validation-runtime.json");
+    std::fs::write(&input, template_validation_input(template).to_string()).assert_value();
+    std::fs::write(
+        &runtime,
+        serde_json::json!({
+            "harness":"codex", "provider":"openai", "model":"validation-model",
+            "connections":{"openai":["OPENAI_API_KEY"]}
+        })
+        .to_string(),
+    )
+    .assert_value();
+    let mut args = [
+        "run",
+        "--title",
+        "Validate named delivery",
+        "--target",
+        "unconfigured-target",
+        "--template",
+        template.name(),
+        "--validate-only",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    args.extend([
+        OsString::from("--cwd"),
+        directory.join("missing-workspace").into_os_string(),
+        OsString::from("--input"),
+        input.into_os_string(),
+        OsString::from("--uniform-runtime-config"),
+        runtime.into_os_string(),
+    ]);
+    args.extend(extra.iter().map(OsString::from));
+    let NativeV2CliCommand::Run(run) =
+        crate::native_v2_cli::parse_native_v2_args(args).assert_value()
+    else {
+        panic!("run command")
+    };
+    *run
+}
+
+fn template_validation_input(template: BuiltinGraphTemplate) -> serde_json::Value {
+    if !matches!(
+        template,
+        BuiltinGraphTemplate::IssueReview | BuiltinGraphTemplate::PrReview
+    ) {
+        return serde_json::json!({"task":"Validate without a source or credential"});
+    }
+    let mut input = serde_json::json!({
+        "url":"https://ghe.example.test/team/project/issues/17",
+        "context":{"title":"Proposal","body":"Review prepared context","reviewScope":{}}
+    });
+    if template == BuiltinGraphTemplate::PrReview {
+        input["url"] = serde_json::json!("https://ghe.example.test/team/project/pull/17");
+        input["context"]["reviewScope"] = serde_json::json!({
+            "baseRepository":"team/project","baseBranch":"main","baseRevision":"a".repeat(40),
+            "headRepository":"team/project","headBranch":"feature","headRevision":"b".repeat(40)
+        });
+        input["context"]["linkedIssues"] = serde_json::json!([]);
+    }
+    input
+}
+
+async fn assert_source_neutral_named_validation(run: RunCommand) {
+    let mut output = Vec::new();
+    let command = NativeV2CliCommand::Run(Box::new(run));
+    assert_eq!(
+        try_execute_native_v2_preflight_with_environment(&command, &mut output, |name| {
+            panic!("validate-only must not read credential field {name}")
+        })
+        .await
+        .assert_value(),
+        Some(CliOutcome::Completed)
+    );
+    assert_eq!(output, b"{\"valid\":true}\n");
+}
+
+#[tokio::test]
+async fn named_pr_and_ship_validate_only_ignore_explicit_source_and_credentials() {
+    let directory = tempfile::tempdir().assert_value();
+    for delivery in ["--pr", "--ship"] {
+        let revision = "a".repeat(40);
+        let run = named_validation_command(
+            directory.path(),
+            BuiltinGraphTemplate::SoftwareChange,
+            &[
+                delivery,
+                "--repository",
+                "https://ghe.example.test/team/project.git",
+                "--branch",
+                "main",
+                "--revision",
+                &revision,
+                "--source-provider",
+                "source.github",
+                "--source-base-url",
+                "https://ghe.example.test",
+            ],
+        );
+        assert_source_neutral_named_validation(run).await;
+    }
+}
+
+#[tokio::test]
+async fn named_validate_only_accepts_every_supported_template_without_a_source() {
+    let directory = tempfile::tempdir().assert_value();
+    for &template in BuiltinGraphTemplate::all() {
+        for delivery in [
+            TemplateDelivery::None,
+            TemplateDelivery::Push,
+            TemplateDelivery::PullRequest,
+            TemplateDelivery::Merge,
+            TemplateDelivery::Comment,
+        ] {
+            if template.materialize(delivery).is_err() {
+                continue;
+            }
+            let run = named_validation_command(
+                directory.path(),
+                template,
+                &["--delivery", delivery.name()],
+            );
+            assert!(run.repository.is_none() && run.branch.is_none() && run.revision.is_none());
+            assert_source_neutral_named_validation(run).await;
+        }
     }
 }
 
@@ -570,6 +705,7 @@ fn intent_command(selection: RunSelection) -> RunCommand {
         target: None,
         cwd: None,
         source_connection: None,
+        source_forge: None,
         title: RunTitle::new("Intent validation").assert_value(),
         input: "input.json".into(),
         selection,
@@ -650,11 +786,7 @@ fn template_binding_insertion_owns_comment_and_git_delivery_nodes() {
     )
     .assert_value();
     let comment_binding = NodeRuntimeBinding::CommentDelivery {
-        connections: connection(
-            crate::native_v2_contract::GITHUB_CONNECTION_KEY,
-            &[GITHUB_TOKEN_ENV],
-        )
-        .assert_value(),
+        connections: DeclaredConnections::default(),
     };
 
     insert_template_binding(&mut runtime, delivery.clone(), push, false).assert_value();
@@ -718,5 +850,165 @@ fn template_binding_insertion_owns_comment_and_git_delivery_nodes() {
         .assert_error()
         .to_string()
         .contains("git_delivery")
+    );
+}
+
+fn named_comment_request(url: &str) -> (RunCommand, PreparedRunRequest) {
+    let graph = BuiltinGraphTemplate::IssueReview
+        .materialize(TemplateDelivery::Comment)
+        .assert_value();
+    let runtime = uniform(UniformHarness::Codex, UniformProvider::OpenAi)
+        .materialize(&graph, PullRequestFeedback::Consider, None)
+        .assert_value();
+    let NativeV2CliCommand::Run(run) = crate::native_v2_cli::parse_native_v2_args(
+        [
+            "run",
+            "--title",
+            "Comment",
+            "--target",
+            "prod",
+            "--input",
+            "input.json",
+            "--profile",
+            "review",
+        ]
+        .into_iter()
+        .map(OsString::from),
+    )
+    .assert_value() else {
+        panic!("run command")
+    };
+    let request = PreparedRunRequest {
+        run_id: openengine_cluster_protocol::RunId::new("source-less-comment"),
+        intent: TargetRunIntent {
+            title: run.title.clone(),
+            graph,
+            initial_input: serde_json::json!({
+                "url":url,
+                "context":{"title":"Issue","body":"Review this","reviewScope":{}}
+            }),
+            runtime,
+            environment: None,
+            branch: None,
+            submission_key: IdempotencyKey::new("source-less-comment").assert_value(),
+        },
+        connections: RunConnectionValues::new(),
+        github_token: None,
+        git_credentials: None,
+        cwd: None,
+        source_connection: None,
+        source: None,
+        profile: None,
+    };
+    (*run, request)
+}
+
+const NAMED_COMMENT_CASES: [(&str, &str, &str); 2] = [
+    (
+        "https://ghe.example.test/team/project/issues/17",
+        "github",
+        "GH_TOKEN",
+    ),
+    (
+        "https://gitlab.example.test/team/project/-/issues/17",
+        "gitlab",
+        "GITLAB_TOKEN",
+    ),
+];
+
+#[test]
+fn named_source_less_comments_materialize_the_canonical_connection_used_by_resume() {
+    for (url, key, field) in NAMED_COMMENT_CASES {
+        let (run, mut request) = named_comment_request(url);
+        let queried = std::cell::RefCell::new(Vec::new());
+        let available = |name: &str| {
+            queried.borrow_mut().push(name.to_owned());
+            Some(OsString::from(if name == field {
+                "canonical-token"
+            } else {
+                "unused-alias"
+            }))
+        };
+        materialize_named_delivery_access(&run, &mut request, &available).assert_value();
+        assert_eq!(queried.borrow().as_slice(), &[field]);
+        let key = ConnectionKey::new(key).assert_value();
+        let field = EnvironmentVariableName::new(field).assert_value();
+        let required = request.intent.runtime.connection_requirements();
+        assert_eq!(
+            required[&key],
+            std::collections::BTreeSet::from([field.clone()])
+        );
+        assert_eq!(
+            request.connections[&key].as_map()[&field],
+            "canonical-token"
+        );
+        let resumed = select_connection_requirements(
+            required
+                .into_iter()
+                .map(|(key, fields)| (key, fields.into_iter().collect()))
+                .collect(),
+            available,
+        )
+        .assert_value();
+        assert_eq!(resumed, request.connections);
+        assert!(request.source.is_none());
+    }
+}
+
+#[test]
+fn named_delivery_does_not_upload_local_cli_token_aliases() {
+    for (url, _, field) in NAMED_COMMENT_CASES {
+        let (run, mut request) = named_comment_request(url);
+        let queried = std::cell::RefCell::new(Vec::new());
+        materialize_named_delivery_access(&run, &mut request, &|name: &str| {
+            queried.borrow_mut().push(name.to_owned());
+            [
+                "GH_ENTERPRISE_TOKEN",
+                "GITHUB_ENTERPRISE_TOKEN",
+                "GITLAB_ACCESS_TOKEN",
+                "OAUTH_TOKEN",
+            ]
+            .contains(&name)
+            .then(|| OsString::from("local-only-token"))
+        })
+        .assert_value();
+        assert_eq!(queried.borrow().as_slice(), &[field]);
+        assert!(request.connections.is_empty());
+    }
+}
+
+#[test]
+fn named_delivery_preserves_explicit_values_and_does_not_repair_partial_connections() {
+    let (run, mut request) = named_comment_request(NAMED_COMMENT_CASES[0].0);
+    let key = ConnectionKey::new("company-ghe").assert_value();
+    let binding = request
+        .intent
+        .runtime
+        .nodes_mut()
+        .values_mut()
+        .find(|binding| matches!(binding, NodeRuntimeBinding::CommentDelivery { .. }))
+        .assert_value();
+    *binding = serde_json::from_value(serde_json::json!({
+        "kind":"comment_delivery","connections":{key.as_str():["GH_TOKEN","OTHER"]}
+    }))
+    .assert_value();
+    let provided = StaticConnectionValues::new(BTreeMap::from([(
+        EnvironmentVariableName::new("GH_TOKEN").assert_value(),
+        "explicit-token".to_owned(),
+    )]))
+    .assert_value();
+    request.connections.insert(key.clone(), provided.clone());
+    materialize_named_delivery_access(&run, &mut request, &|name| {
+        panic!("explicit connection unexpectedly read {name}")
+    })
+    .assert_value();
+    assert_eq!(request.connections[&key], provided);
+    let submission = crate::native_v2_local::local_submission(&request.intent, None);
+    assert!(
+        crate::native_v2_supervisor::RunEnvironment::exact_for_submission(
+            &submission,
+            request.connections,
+        )
+        .is_err()
     );
 }
